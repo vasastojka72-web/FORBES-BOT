@@ -1,0 +1,34 @@
+SUPABASE SETUP ДЛЯ FORBES BOT
+
+Це потрібно, щоб дані НЕ пропадали при:
+- іншому Google акаунті;
+- іншому браузері;
+- перезапуску Render;
+- redeploy Render.
+
+1) Створи Supabase project.
+2) Відкрий SQL Editor.
+3) Виконай цей SQL:
+
+create table if not exists forbes_db (
+  id text primary key,
+  data jsonb not null default '{}'::jsonb,
+  updated_at timestamptz not null default now()
+);
+
+4) Supabase → Project Settings → API:
+   скопіюй:
+   - Project URL
+   - service_role key
+
+5) Render → Environment:
+   додай:
+   SUPABASE_URL = твій Project URL
+   SUPABASE_SERVICE_ROLE_KEY = твій service_role key
+   SUPABASE_DB_KEY = forbes_main
+
+6) Deploy бота.
+
+Після цього дані зберігаються в Supabase.
+Старі farm-звіти видаляються тільки коли натискаєш:
+“Відправити ЗП і закрити тиждень”.

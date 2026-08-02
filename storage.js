@@ -9,6 +9,7 @@ const DEFAULT_DB = {
   contracts: [],
   cars: [],
   familyInfo: {},
+  siteSettings: {},
   applications: [],
   farmReports: [],
   farmReportsArchive: [],

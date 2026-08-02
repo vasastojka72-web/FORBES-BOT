@@ -465,41 +465,95 @@ function publicCleanCars(db){
     createdAt:c.createdAt||""
   }));
 }
+function mergedSiteSettings(db){
+  const legacy=(db && db.familyInfo && typeof db.familyInfo==="object")?db.familyInfo:{};
+  const dedicated=(db && db.siteSettings && typeof db.siteSettings==="object")?db.siteSettings:{};
+  const historyObj=(db && db.familyHistory && typeof db.familyHistory==="object")?db.familyHistory:{};
+  const history=String(dedicated.history ?? legacy.history ?? legacy.description ?? historyObj.text ?? "");
+  const rules=String(dedicated.familyRules ?? legacy.familyRules ?? "");
+  const legalUpdated=String(dedicated.legalUpdated ?? legacy.legalUpdated ?? "");
+  return {
+    ...legacy,
+    ...dedicated,
+    history,
+    description:String(dedicated.description ?? legacy.description ?? history),
+    familyRules:rules,
+    legalUpdated
+  };
+}
+
+function siteSettingsPayload(body, old){
+  const has=(key)=>Object.prototype.hasOwnProperty.call(body,key);
+  const text=(v,max=200000)=>String(v??"").slice(0,max);
+  const keep=(key, max=200000)=>has(key)?text(body[key],max):text(old[key],max);
+  return {
+    ...old,
+    aboutDescription:keep("aboutDescription",20000),
+    aboutWho:keep("aboutWho",20000),
+    aboutValues:keep("aboutValues",20000),
+    aboutNo:keep("aboutNo",20000),
+    history:has("history")?text(body.history,200000):(has("description")?text(body.description,200000):text(old.history||old.description,200000)),
+    description:has("description")?text(body.description,200000):(has("history")?text(body.history,200000):text(old.description||old.history,200000)),
+    familyRules:keep("familyRules",300000),
+    legalContact:has("legalContact")?text(body.legalContact,5000):text(old.legalContact||"Discord сервер FORBES",5000),
+    legalUpdated:keep("legalUpdated",40),
+    familySignUrl:has("familySignUrl")?text(body.familySignUrl,5000):text(old.familySignUrl,5000),
+    houseLocation:keep("houseLocation",10000),
+    housePrimeTime:keep("housePrimeTime",10000),
+    houseRole:keep("houseRole",10000),
+    houseMode:keep("houseMode",10000),
+    housePriority:keep("housePriority",10000),
+    houseDescription:keep("houseDescription",100000),
+    housePhotoUrl:has("housePhotoUrl")?text(body.housePhotoUrl,5000):text(old.housePhotoUrl,5000),
+    leadership:Array.isArray(body.leadership)?body.leadership.slice(0,20).map(x=>({
+      role:text(x?.role,100),name:text(x?.name,100),staticId:text(x?.staticId,40),
+      description:text(x?.description,500),photoUrl:text(x?.photoUrl,5000),visible:x?.visible!==false
+    })):(Array.isArray(old.leadership)?old.leadership:[]),
+    updatedAt:now()
+  };
+}
+
+async function persistSiteSettings(db, body){
+  const old=mergedSiteSettings(db);
+  const saved=siteSettingsPayload(body||{},old);
+  db.siteSettings={...saved};
+  db.familyInfo={...(db.familyInfo||{}),...saved};
+  db.familyHistory={
+    ...(db.familyHistory||{}),
+    title:(db.familyHistory&&db.familyHistory.title)||"Історія сім’ї",
+    text:saved.history,
+    photos:Array.isArray(db.familyHistory?.photos)?db.familyHistory.photos:[],
+    updatedAt:saved.updatedAt
+  };
+  const wr=await writeDbAsync(db);
+  if(!wr.ok) throw new Error(wr.error||"db_write_failed");
+  return mergedSiteSettings(readDb());
+}
+
 app.get("/api/family-info", async (req,res)=>{
-  try{ const db=readDb(); const info=db.familyInfo||{}; res.json({ok:true,familyInfo:info,info}); }
-  catch(e){ console.error("family info get error",e); res.status(500).json({ok:false,error:"family_info_get_failed",message:e.message}); }
+  try{const db=readDb();const info=mergedSiteSettings(db);res.json({ok:true,familyInfo:info,siteSettings:info,info});}
+  catch(e){console.error("family info get error",e);res.status(500).json({ok:false,error:"family_info_get_failed",message:e.message});}
 });
 
 app.post("/api/family-info", protect, async (req,res)=>{
   try{
     if(!forbesMainIdFromReq(req)) return res.status(403).json({ok:false,error:"no_permission",message:"Ваш Discord ID не має доступу."});
-    const db=readDb(); const old=db.familyInfo||{};
-    db.familyInfo={...old,
-      name:req.body.name||req.body.familyName||old.name||"FORBES", familyName:req.body.familyName||req.body.name||old.familyName||"FORBES",
-      leader:req.body.leader??old.leader??"", deputy:req.body.deputy??old.deputy??"", seniorCapt:req.body.seniorCapt??old.seniorCapt??"",
-      seniorFarmer:req.body.seniorFarmer??req.body.farmManager??old.seniorFarmer??old.farmManager??"", farmManager:req.body.farmManager??req.body.seniorFarmer??old.farmManager??old.seniorFarmer??"",
-      history:req.body.history??req.body.description??old.history??old.description??"", description:req.body.description??req.body.history??old.description??old.history??"",
-      housePhotoUrl:req.body.housePhotoUrl!==undefined?req.body.housePhotoUrl:(req.body.housePhoto!==undefined?req.body.housePhoto:(old.housePhotoUrl??old.housePhoto??old.mansionPhoto??"")), officePhotoUrl:req.body.officePhotoUrl!==undefined?req.body.officePhotoUrl:(req.body.officePhoto!==undefined?req.body.officePhoto:(old.officePhotoUrl??old.officePhoto??"")),
-      houseLocation:req.body.houseLocation??req.body.location??old.houseLocation??old.location??"",
-      housePrimeTime:req.body.housePrimeTime??req.body.primeTime??old.housePrimeTime??old.primeTime??"",
-      houseRole:req.body.houseRole??old.houseRole??"",
-      houseMode:req.body.houseMode??old.houseMode??"",
-      housePriority:req.body.housePriority??old.housePriority??"",
-      houseDescription:req.body.houseDescription??old.houseDescription??"",
-      aboutDescription:req.body.aboutDescription??old.aboutDescription??"",
-      aboutWho:req.body.aboutWho??old.aboutWho??"",
-      aboutValues:req.body.aboutValues??old.aboutValues??"",
-      aboutNo:req.body.aboutNo??old.aboutNo??"",
-      familyRules:req.body.familyRules??old.familyRules??"",
-      legalContact:req.body.legalContact??old.legalContact??"Discord сервер FORBES",
-      legalUpdated:req.body.legalUpdated??old.legalUpdated??"",
-      familySignUrl:req.body.familySignUrl!==undefined?req.body.familySignUrl:(old.familySignUrl??""),
-      leadership:Array.isArray(req.body.leadership)?req.body.leadership.slice(0,20).map(x=>({role:String(x?.role||"").slice(0,100),name:String(x?.name||"").slice(0,100),staticId:String(x?.staticId||"").slice(0,40),description:String(x?.description||"").slice(0,300),photoUrl:String(x?.photoUrl||"").slice(0,2000),visible:x?.visible!==false})):Array.isArray(old.leadership)?old.leadership:[],
-      updatedAt:now()
-    };
-    delete db.familyInfo.rightHand; delete db.familyInfo.right; delete db.familyInfo.housePhotoData; delete db.familyInfo.officePhotoData; delete db.familyInfo.imageData; delete db.familyInfo.photoData;
-    writeDb(db); res.json({ok:true,familyInfo:db.familyInfo,info:db.familyInfo});
-  }catch(e){ console.error("family info save error",e); res.status(500).json({ok:false,error:"family_info_save_failed",message:e.message}); }
+    const saved=await persistSiteSettings(readDb(),req.body||{});
+    res.json({ok:true,familyInfo:saved,siteSettings:saved,info:saved,persisted:true});
+  }catch(e){console.error("family info save error",e);res.status(500).json({ok:false,error:"family_info_save_failed",message:e.message});}
+});
+
+app.get("/api/site-settings", async (req,res)=>{
+  try{const info=mergedSiteSettings(readDb());res.json({ok:true,siteSettings:info,familyInfo:info,info});}
+  catch(e){console.error("site settings get error",e);res.status(500).json({ok:false,error:"site_settings_get_failed",message:e.message});}
+});
+
+app.post("/api/site-settings", protect, async (req,res)=>{
+  try{
+    if(!forbesMainIdFromReq(req)) return res.status(403).json({ok:false,error:"no_permission",message:"Ваш Discord ID не має доступу."});
+    const saved=await persistSiteSettings(readDb(),req.body||{});
+    res.json({ok:true,siteSettings:saved,familyInfo:saved,info:saved,persisted:true});
+  }catch(e){console.error("site settings save error",e);res.status(500).json({ok:false,error:"site_settings_save_failed",message:e.message});}
 });
 
 app.get("/api/cars", async (req,res)=>{

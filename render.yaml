@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: forbes-bot-api
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: GUILD_ID
+        value: "1504699361668497419"
+      - key: OWNER_ID
+        value: "502825427761365026"
+      - key: PORT
+        value: "10000"

@@ -1902,6 +1902,41 @@ client.on("interactionCreate", async interaction=>{
     const db=readDb();
     const member = await interactionMember(interaction);
 
+    // РОЗІГРАШІ: кнопка участі для всіх учасників Discord
+    if(action==="giveaway_join"){
+      const giveaway=(Array.isArray(db.giveaways)?db.giveaways:[]).find(x=>String(x.id)===String(itemId));
+      if(!giveaway) return interaction.reply({content:"❌ Розіграш не знайдено.",ephemeral:true});
+      if(String(giveaway.status||"active").toLowerCase()!=="active") return interaction.reply({content:"🏁 Цей розіграш уже завершено.",ephemeral:true});
+
+      giveaway.participants=Array.isArray(giveaway.participants)?giveaway.participants:[];
+      const userId=String(interaction.user.id);
+      const exists=giveaway.participants.some(x=>String(x.userId||x.id||"")===userId);
+      if(exists) return interaction.reply({content:"✅ Ти вже береш участь у цьому розіграші.",ephemeral:true});
+
+      giveaway.participants.push({
+        userId,
+        username:interaction.user.globalName||interaction.user.username||"Учасник",
+        tag:interaction.user.tag||interaction.user.username||"",
+        joinedAt:now()
+      });
+      giveaway.participantsCount=giveaway.participants.length;
+      await writeDbAsync(db);
+
+      try{
+        await interaction.message.edit({
+          embeds:[embed("🎁 "+(giveaway.title||"Розіграш"),
+            `**Приз:** ${giveaway.prize||"-"}\n`+
+            `**Умови:** ${giveaway.rules||"-"}\n\n`+
+            `Натисни кнопку **✅ Беру участь**, щоб взяти участь.\n`+
+            `**Учасників:** ${giveaway.participants.length}`
+          )],
+          components:[row([{id:`giveaway_join:${giveaway.id}`,label:"✅ Беру участь",style:ButtonStyle.Success}])]
+        });
+      }catch(e){ console.error("Giveaway participant count edit failed:",e); }
+
+      return interaction.reply({content:"✅ Тебе додано до розіграшу!",ephemeral:true});
+    }
+
     // ЗАЯВКИ: права залежать від типу заявки
     if(action==="app_approve"||action==="app_reject"){
       const app=db.applications.find(x=>x.id===itemId);
@@ -3271,11 +3306,11 @@ app.post("/api/giveaways", protect, async (req,res)=>{
           embeds:[embed("🎁 "+item.title,
             `**Приз:** ${item.prize}\n`+
             `**Умови:** ${item.rules || "-"}\n\n`+
-            `Натисни кнопку **✅ Участвую**, щоб взяти участь.\n`+
+            `Натисни кнопку **✅ Беру участь**, щоб взяти участь.\n`+
             `**Учасників:** 0`
           )],
           components:[row([
-            {id:`giveaway_join:${item.id}`,label:"✅ Участвую",style:ButtonStyle.Success}
+            {id:`giveaway_join:${item.id}`,label:"✅ Беру участь",style:ButtonStyle.Success}
           ])]
         });
         item.messageId = msg?.id || "";

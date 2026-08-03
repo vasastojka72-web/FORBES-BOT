@@ -728,6 +728,19 @@ app.post("/api/applications", protect, async (req,res)=>{
 });
 
 
+function safeRemoteMediaUrl(value){
+  const v=String(value||"").trim();
+  return /^https?:\/\//i.test(v) ? v : "";
+}
+function stripTransientMediaFields(obj){
+  if(!obj || typeof obj!=="object") return obj;
+  const copy={...obj};
+  for(const key of ["screenshotData","imageData","photoData","fileData","attachmentData","proofData","proofImageData"]){
+    delete copy[key];
+  }
+  return copy;
+}
+
 app.get("/api/farm-reports", protect, async (req,res)=>{
   const member = await requireFamilyRole(req, res); if(!member) return;
   res.set("Cache-Control","no-store, no-cache, must-revalidate, private");
@@ -785,7 +798,7 @@ if(!memberHasRealServerRole(member)){
       familyShare,
       players,
       comment:req.body.comment || "",
-      screenshotUrl:req.body.screenshotUrl || "",
+      screenshotUrl:safeRemoteMediaUrl(req.body.screenshotUrl),
       status:"pending",
       discordStatus:"pending",
       createdAt:now()
@@ -804,7 +817,10 @@ if(!memberHasRealServerRole(member)){
       {id:`farm_reject:${item.id}`,label:"❌ Відхилити",style:ButtonStyle.Danger}
     ])];
 
+    const farmPlayersLabel = await formatFarmPlayersForDiscord(players);
     const content = {
+      content:item.discordUserId?`<@${item.discordUserId}>`:undefined,
+      allowedMentions:{users:item.discordUserId?[item.discordUserId]:[]},
       embeds:[embed("🚜 Фарм-звіт на перевірку",
         `**№ звіту:** ${item.id}\n`+
         `**Гравець:** ${item.discordUserId ? `<@${item.discordUserId}>` : item.player || "-"}\n`+
@@ -813,7 +829,7 @@ if(!memberHasRealServerRole(member)){
         `**У банк сімʼї 20%:** ${money(familyShare)}\n`+
         `**Гравцям 80%:** ${money(Math.floor(amount*0.8))}\n`+
         `**Кожному:** ${money(each)}\n`+
-        `**Гравці:** ${players.map(p=>`${p.nick || p.name || "-"} (${p.id || p.staticId || "-"})`).join(", ") || "-"}\n`+
+        `**Гравці:** ${farmPlayersLabel}\n`+
         `**Коментар:** ${item.comment || "-"}`
       )],
       components
@@ -1190,23 +1206,50 @@ app.post("/api/fines", protect, async (req,res)=>{
 
     const db=readDb();
     db.fines = Array.isArray(db.fines) ? db.fines : [];
+    const targetMember = await findDiscordMemberForRecord(req.body || {});
     const item={
       id:id("fine"),
       nickname:req.body.nickname||req.body.nick||"",
       staticId:req.body.staticId||req.body.playerId||"",
       amount:Number(req.body.amount||0),
       reason:req.body.reason||"",
-      screenshotUrl:req.body.screenshotUrl||req.body.screen||"",
+      screenshotUrl:safeRemoteMediaUrl(req.body.screenshotUrl||req.body.screen),
+      discordUserId:targetMember?.id || req.body.discordUserId || "",
       status:"unpaid",
       createdAt:now(),
-      createdBy:req.user?.username||req.user?.name||req.body.createdBy||""
+      createdBy:member.displayName||member.user?.username||req.user?.name||"",
+      createdByDiscordId:member.id
     };
     db.fines.unshift(item);
     writeDb(db);
 
-    const payload = {embeds:[embed("🚨 Новий штраф", `**№:** ${item.id}\n**Гравець:** ${item.nickname} | ${item.staticId}\n**Сума:** ${money(item.amount)}\n**Причина:** ${item.reason}\n**Видав:** ${item.createdBy || "-"}`)]};
-    const sent = await forbesSendToChannel(CONFIG.channels.fines, payload, "fine");
-    res.json({ok:true,fine:item,discordSent:sent});
+    const playerLabel = await discordPlayerLabel(item);
+    const issuerLabel = `${member.displayName||member.user?.username||item.createdBy} (<@${member.id}>)`;
+    const payload = {content:item.discordUserId?`<@${item.discordUserId}>`:undefined,allowedMentions:{users:item.discordUserId?[item.discordUserId]:[]},embeds:[embed("🚨 Новий штраф", `**№:** ${item.id}
+**Гравець:** ${playerLabel}
+**Сума:** ${money(item.amount)}
+**Причина:** ${item.reason}
+**Видав:** ${issuerLabel}`)]};
+
+    let targetChannel = null;
+    if(CONFIG.channels.fines) targetChannel = await channel(CONFIG.channels.fines);
+    if(!targetChannel && CONFIG?.channels?.botLogs) targetChannel = await channel(CONFIG.channels.botLogs);
+
+    let sent = false;
+    let screenshotSent = false;
+    let screenshotTooLarge = false;
+    if(targetChannel){
+      const result = await sendWithOptionalScreenshot(targetChannel, payload, req.body, `fine-${item.id}.jpg`);
+      sent = Boolean(result && result.ok);
+      screenshotSent = Boolean(result && result.screenshot);
+      screenshotTooLarge = Boolean(result && result.tooLarge);
+    }
+
+    item.screenshotAttached = screenshotSent;
+    item.screenshotTooLarge = screenshotTooLarge;
+    writeDb(db);
+
+    res.json({ok:true,fine:item,discordSent:sent,screenshotSent,screenshotTooLarge});
   }catch(e){
     console.error("POST /api/fines failed:", e);
     res.status(500).json({ok:false,error:"fine_create_failed",message:e.message});
@@ -1218,12 +1261,14 @@ app.post("/api/fine-payments", protect, async (req,res)=>{
   /* FORBES_DISC_ALL_PATCH */
   if(member && !canDisciplineAll(member, req)) return denyPerm(res,"Недостатньо прав для штрафів/доган.");
   const db=readDb();
+  const targetMember=await findDiscordMemberForRecord(req.body||{});
   const item={
     id:nextSimpleId(db,"finepay",["fines","finePayments"]),
     fineId:req.body.fineId||"",
     nickname:req.body.nickname||req.body.nick||"",
     staticId:req.body.staticId||req.body.playerId||"",
-    screenshotUrl:req.body.screenshotUrl||"",
+    screenshotUrl:safeRemoteMediaUrl(req.body.screenshotUrl),
+    discordUserId:targetMember?.id||req.body.discordUserId||"",
     status:"pending",
     createdAt:now()
   };
@@ -1239,13 +1284,16 @@ app.post("/api/fine-payments", protect, async (req,res)=>{
   writeDb(db);
 
   const ch=await channel(CONFIG.channels.finePayments);
+  const paymentPlayerLabel=await discordPlayerLabel(item);
   if(ch) await sendWithOptionalScreenshot(ch, {
+    content:item.discordUserId?`<@${item.discordUserId}>`:undefined,
+    allowedMentions:{users:item.discordUserId?[item.discordUserId]:[]},
     embeds:[embed("💳 Оплата штрафу на перевірку",
       `**Оплата №:** ${item.id}
 ` +
       `**Штраф №:** ${item.fineId}
 ` +
-      `**Гравець:** ${item.nickname} | ${item.staticId}`
+      `**Гравець:** ${paymentPlayerLabel}`
     )],
     components:[row([
       {id:`finepay_approve:${item.id}`,label:"✅ Одобрити оплату",style:ButtonStyle.Success},
@@ -1256,26 +1304,47 @@ app.post("/api/fine-payments", protect, async (req,res)=>{
   res.json({ok:true,payment:item});
 });
 app.post("/api/warnings", protect, async (req,res)=>{
-  const db=readDb(); const expires=new Date(Date.now()+CONFIG.warnings.days*86400000); const item={id:nextSimpleId(db,"warn",["warnings"]),nickname:req.body.nickname||req.body.nick||"",staticId:req.body.staticId||req.body.playerId||"",reason:req.body.reason||"",screenshotUrl:req.body.screenshotUrl||"",status:"active",expiresAt:expires.toISOString(),createdAt:now()};
-  db.warnings.unshift(item); writeDb(db); const count=db.warnings.filter(w=>w.staticId===item.staticId&&w.status==="active").length; const ch=await channel(CONFIG.channels.warnings); if(ch) sendWithOptionalScreenshot(ch, {embeds:[embed("🚫 Нова догана", `**№:** ${item.id}\n**Гравець:** ${item.nickname} | ${item.staticId}\n**Причина:** ${item.reason}\n**Діє до:** ${expires.toLocaleDateString("uk-UA")}\n**Активних доган:** ${count}${count>=CONFIG.warnings.kickAt?"\n\n⚠️ **3 догани — кікнути / на розгляд**":""}`)]}, req.body, "warning.png"); 
+  try{
+    const member=await requireFamilyRole(req,res); if(!member)return;
+    if(member&&typeof canDisciplineAll==="function"&&!canDisciplineAll(member,req)) return denyPerm(res,"Недостатньо прав для штрафів/доган.");
+    const db=readDb(); db.warnings=Array.isArray(db.warnings)?db.warnings:[];
+    const expires=new Date(Date.now()+CONFIG.warnings.days*86400000);
+    const targetMember=await findDiscordMemberForRecord(req.body||{});
+    const item={id:nextSimpleId(db,"warn",["warnings"]),nickname:req.body.nickname||req.body.nick||"",staticId:req.body.staticId||req.body.playerId||"",discordUserId:targetMember?.id||req.body.discordUserId||"",reason:req.body.reason||"",screenshotUrl:safeRemoteMediaUrl(req.body.screenshotUrl),status:"active",expiresAt:expires.toISOString(),createdAt:now(),createdBy:member.displayName||member.user?.username||"",createdByDiscordId:member.id};
+    db.warnings.unshift(item); writeDb(db);
+    const count=db.warnings.filter(w=>w.staticId===item.staticId&&w.status==="active").length;
+    const ch=await channel(CONFIG.channels.warnings);
+    if(ch){
+      const playerLabel=await discordPlayerLabel(item);
+      const issuerLabel=`${member.displayName||member.user?.username||"-"} (<@${member.id}>)`;
+      await sendWithOptionalScreenshot(ch,{content:item.discordUserId?`<@${item.discordUserId}>`:undefined,allowedMentions:{users:item.discordUserId?[item.discordUserId]:[]},embeds:[embed("🚫 Нова догана",`**№:** ${item.id}\n**Гравець:** ${playerLabel}\n**Причина:** ${item.reason}\n**Видав:** ${issuerLabel}\n**Діє до:** ${expires.toLocaleDateString("uk-UA")}\n**Активних доган:** ${count}${count>=CONFIG.warnings.kickAt?"\n\n⚠️ **3 догани — кікнути / на розгляд**":""}`)]},req.body,"warning.png");
+    }
+    res.json({ok:true,warning:item});
+  }catch(e){console.error("POST /api/warnings failed:",e);res.status(500).json({ok:false,error:"warning_create_failed",message:e.message});}
+});
 app.post("/api/warning-payments", protect, async (req,res)=>{
   try{
     const member = await requireFamilyRole(req, res); if(!member) return;
     const db=readDb();
     db.warningPayments = Array.isArray(db.warningPayments) ? db.warningPayments : [];
+    const targetMember=await findDiscordMemberForRecord(req.body||{});
     const item={
       id:id("warnpay"),
       warningId:req.body.warningId||"",
       nickname:req.body.nickname||req.body.nick||"",
       staticId:req.body.staticId||req.body.playerId||"",
-      screenshotUrl:req.body.screenshotUrl||"",
+      screenshotUrl:safeRemoteMediaUrl(req.body.screenshotUrl),
+      discordUserId:targetMember?.id||req.body.discordUserId||"",
       status:"pending",
       createdAt:now()
     };
     db.warningPayments.unshift(item);
     writeDb(db);
     const ch=await channel(CONFIG.channels.warningRemoval);
+    const warningPaymentPlayerLabel=await discordPlayerLabel(item);
     if(ch) await sendWithOptionalScreenshot(ch, {
+      content:item.discordUserId?`<@${item.discordUserId}>`:undefined,
+      allowedMentions:{users:item.discordUserId?[item.discordUserId]:[]},
       embeds:[embed("🧾 Зняття догани на перевірку",
         `**Запит №:** ${item.id}\n**Догана №:** ${item.warningId}\n**Гравець:** ${item.nickname} | ${item.staticId}`
       )],
@@ -1290,10 +1359,6 @@ app.post("/api/warning-payments", protect, async (req,res)=>{
     res.status(500).json({ok:false,error:"warning_payment_failed",message:e.message});
   }
 });
-res.json({ok:true,warning:item});
-});
-
-
 app.get("/api/warnings", protect, (req,res)=>{
   const db = readDb();
   res.json({ok:true,warnings:db.warnings || []});
@@ -1355,8 +1420,9 @@ app.post("/api/fines/:id/remind", protect, async (req,res)=>{
     if(!f) return res.status(404).json({ok:false,error:"fine_not_found"});
     const ch = await channel(CONFIG.channels.fines);
     if(ch){
-      await ch.send({embeds:[embed("🔔 Нагадування про штраф",
-        `**Гравець:** ${f.nickname || f.nick || "-"} | ${f.staticId || f.playerId || "-"}\n` +
+      const playerLabel=await discordPlayerLabel(f); const target=await findDiscordMemberForRecord(f);
+      await ch.send({content:target?`<@${target.id}>`:undefined,allowedMentions:{users:target?[target.id]:[]},embeds:[embed("🔔 Нагадування про штраф",
+        `**Гравець:** ${playerLabel}\n` +
         `**Сума:** ${money(f.amount || 0)}\n` +
         `**Причина:** ${f.reason || "-"}\n\n` +
         `⚠️ Будь ласка, оплатіть штраф і надішліть скрін оплати.`
@@ -1418,8 +1484,9 @@ app.post("/api/warnings/:id/remind", protect, async (req,res)=>{
     if(!w) return res.status(404).json({ok:false,error:"warning_not_found"});
     const ch = await channel(CONFIG.channels.warnings);
     if(ch){
-      await ch.send({embeds:[embed("🔔 Нагадування про догану",
-        `**Гравець:** ${w.nickname || w.nick || "-"} | ${w.staticId || w.playerId || "-"}\n` +
+      const playerLabel=await discordPlayerLabel(w); const target=await findDiscordMemberForRecord(w);
+      await ch.send({content:target?`<@${target.id}>`:undefined,allowedMentions:{users:target?[target.id]:[]},embeds:[embed("🔔 Нагадування про догану",
+        `**Гравець:** ${playerLabel}\n` +
         `**Причина:** ${w.reason || "-"}\n` +
         `**Статус:** активна догана`
       )]});
@@ -2120,6 +2187,50 @@ function kyivLocalToDate(year, month, day, hour, minute){
 }
 
 
+async function findDiscordMemberForRecord(record={}){
+  try{
+    const guild = await client.guilds.fetch(CONFIG.guildId);
+    const directId = String(record.discordUserId || record.userId || record.memberId || record.discordId || "").replace(/\D/g,"");
+    if(directId){
+      const direct = await guild.members.fetch(directId).catch(()=>null);
+      if(direct) return direct;
+    }
+    const wantedNick = String(record.nickname || record.nick || record.player || record.name || "").trim().toLowerCase();
+    const wantedStatic = String(record.staticId || record.playerId || record.id || "").trim();
+    const members = await guild.members.fetch().catch(()=>guild.members.cache);
+    let nickMatch = null;
+    for(const m of members.values()){
+      if(m.user?.bot) continue;
+      const display = String(m.displayName || m.nickname || m.user?.username || "");
+      const parsed = parseForbesStaticNickFinal(display);
+      if(wantedStatic && parsed.staticId && String(parsed.staticId) === wantedStatic) return m;
+      if(wantedNick){
+        const cleanDisplay = String(parsed.nick || display).trim().toLowerCase();
+        if(cleanDisplay === wantedNick || display.trim().toLowerCase() === wantedNick) nickMatch = nickMatch || m;
+      }
+    }
+    return nickMatch;
+  }catch(e){
+    console.warn("Discord member resolve failed:", e?.message || e);
+    return null;
+  }
+}
+
+async function discordPlayerLabel(record={}, fallback="-"){
+  const member = await findDiscordMemberForRecord(record);
+  if(member) return `${member.displayName} (<@${member.id}>)`;
+  const nick = record.nickname || record.nick || record.player || record.name || fallback;
+  const sid = record.staticId || record.playerId || "";
+  return sid ? `${nick} | ${sid}` : String(nick || fallback);
+}
+
+async function formatFarmPlayersForDiscord(players=[]){
+  if(!Array.isArray(players) || !players.length) return "-";
+  const labels=[];
+  for(const p of players) labels.push(await discordPlayerLabel(p));
+  return labels.join(", ");
+}
+
 async function resolveMemberLabel(userId){
   try{
     const guild = await client.guilds.fetch(CONFIG.guildId);
@@ -2294,7 +2405,12 @@ async function postCaptList(captId){
 }
 
 
-cron.schedule("0 12 * * *", async()=>{ const db=readDb(); const unpaid=db.fines.filter(f=>f.status==="unpaid"); if(!unpaid.length) return; const ch=await channel(CONFIG.channels.fines); if(ch) ch.send({embeds:[embed("⏰ Нагадування про неоплачені штрафи", unpaid.map(f=>`• **${f.id}** — ${f.nickname} | ${f.staticId} — ${money(f.amount)}`).join("\n"))]}).catch(()=>{}); });
+cron.schedule("0 12 * * *", async()=>{
+  const db=readDb();const unpaid=(db.fines||[]).filter(f=>f.status==="unpaid");if(!unpaid.length)return;
+  const ch=await channel(CONFIG.channels.fines);if(!ch)return;const labels=[];const ids=[];
+  for(const f of unpaid){const m=await findDiscordMemberForRecord(f);if(m)ids.push(m.id);labels.push(`• **${f.id}** — ${await discordPlayerLabel(f)} — ${money(f.amount)}`);}
+  const unique=[...new Set(ids)];ch.send({content:unique.length?unique.map(id=>`<@${id}>`).join(" "):undefined,allowedMentions:{users:unique},embeds:[embed("⏰ Нагадування про неоплачені штрафи",labels.join("\n"))]}).catch(()=>{});
+});
 async function registerCommands(){ if(!client.user) return; const commands=[new SlashCommandBuilder().setName("ping").setDescription("Перевірити чи бот онлайн"),new SlashCommandBuilder().setName("stats").setDescription("Статистика FORBES")].map(c=>c.toJSON()); const rest=new REST({version:"10"}).setToken(process.env.DISCORD_BOT_TOKEN); await rest.put(Routes.applicationGuildCommands(client.user.id, CONFIG.guildId), {body:commands}); }
 
 
@@ -2587,10 +2703,11 @@ app.post("/api/reminders/fines", protect, async (req,res)=>{
     const unpaid=(db.fines||[]).filter(f=>f.status!=="paid"&&f.status!=="closed");
     const ch=await channel(CONFIG.channels.fines);
     if(!ch) return res.status(404).json({ok:false,error:"fines_channel_not_found"});
-    const text = unpaid.length
-      ? unpaid.map(f=>`• **${f.id}** — ${f.nickname||f.player||"-"} | ID: ${f.staticId||f.discordUserId||"-"} — **${money(Number(f.amount||0))}**`).join("\n")
-      : "Немає неоплачених штрафів.";
-    await ch.send({embeds:[embed("🔔 Нагадування про неоплачені штрафи", text)]});
+    const labels=[];const mentionIds=[];
+    for(const f of unpaid){const m=await findDiscordMemberForRecord(f);if(m)mentionIds.push(m.id);labels.push(`• **${f.id}** — ${await discordPlayerLabel(f)} — **${money(Number(f.amount||0))}**`);}
+    const text=labels.length?labels.join("\n"):"Немає неоплачених штрафів.";
+    const ids=[...new Set(mentionIds)];
+    await ch.send({content:ids.length?ids.map(id=>`<@${id}>`).join(" "):undefined,allowedMentions:{users:ids},embeds:[embed("🔔 Нагадування про неоплачені штрафи",text)]});
     securityLog("Нагадування про штрафи", req.user?.id || member.id, {count:unpaid.length});
     res.json({ok:true,count:unpaid.length});
   }catch(e){
@@ -2612,10 +2729,11 @@ app.post("/api/reminders/warnings", protect, async (req,res)=>{
     const active=(db.warnings||[]).filter(w=>w.status==="active");
     const ch=await channel(CONFIG.channels.warnings);
     if(!ch) return res.status(404).json({ok:false,error:"warnings_channel_not_found"});
-    const text = active.length
-      ? active.map(w=>`• **${w.id}** — ${w.nickname||w.player||"-"} | ID: ${w.staticId||w.discordUserId||"-"} — ${w.reason||"-"}`).join("\n")
-      : "Немає активних доган.";
-    await ch.send({embeds:[embed("🔔 Нагадування про активні догани", text)]});
+    const labels=[];const mentionIds=[];
+    for(const w of active){const m=await findDiscordMemberForRecord(w);if(m)mentionIds.push(m.id);labels.push(`• **${w.id}** — ${await discordPlayerLabel(w)} — ${w.reason||"-"}`);}
+    const text=labels.length?labels.join("\n"):"Немає активних доган.";
+    const ids=[...new Set(mentionIds)];
+    await ch.send({content:ids.length?ids.map(id=>`<@${id}>`).join(" "):undefined,allowedMentions:{users:ids},embeds:[embed("🔔 Нагадування про активні догани",text)]});
     securityLog("Нагадування про догани", req.user?.id || member.id, {count:active.length});
     res.json({ok:true,count:active.length});
   }catch(e){
@@ -3274,6 +3392,42 @@ app.get("/api/announcements", protect, async (req,res)=>{
   }catch(e){res.status(500).json({ok:false,error:"announcements_get_failed",message:e.message});}
 });
 
+async function finalizeGiveawayDiscord(g, winners=[], {closedWithoutWinner=false}={}){
+  const participants=Array.isArray(g.participants)?g.participants:[];
+  const winnerLine = w => {
+    const mention=w.userId?`<@${w.userId}>`:"";
+    const nick=w.nickname||w.nick||w.displayName||w.username||w.name||"Учасник";
+    const sid=w.staticId||w.playerId||"";
+    return `${mention||`**${nick}**`}${mention?` — **${nick}**`:""}${sid?` | ID: **${sid}**`:""}`;
+  };
+  const winnersText=winners.map((w,i)=>`**${i+1}.** ${winnerLine(w)}`).join("\n");
+  const statusText=closedWithoutWinner?"🔒 **Розіграш закрито без вибору переможця**":`🏁 **Розіграш завершено**\n\n${winnersText}`;
+  let discordSent=false,discordError="";
+  try{
+    const ch=await channel(CONFIG.channels.giveawayWinners||"1505075996100137110");
+    if(!ch) discordError=`Канал переможців не знайдено: ${CONFIG.channels.giveawayWinners}`;
+    else if(!closedWithoutWinner){
+      const mentionIds=winners.map(w=>String(w.userId||"")).filter(Boolean);
+      await ch.send({
+        content:mentionIds.map(id=>`<@${id}>`).join(" ")||undefined,
+        allowedMentions:{users:mentionIds},
+        embeds:[embed("🏆 Переможець розіграшу: "+(g.title||"-"),`**Приз:** ${g.prize||"-"}\n\n${winnersText}`)]
+      });
+      discordSent=true;
+    }
+  }catch(e){discordError=e.message||String(e);console.error("Giveaway winners send failed:",e);}
+  try{
+    if(g.messageId&&CONFIG.channels.giveawayActive){
+      const activeCh=await channel(CONFIG.channels.giveawayActive);
+      const msg=activeCh?await activeCh.messages.fetch(g.messageId).catch(()=>null):null;
+      if(msg){
+        await msg.edit({embeds:[embed("🎁 "+(g.title||"Розіграш")+(closedWithoutWinner?" — закрито":" — завершено"),`**Приз:** ${g.prize||"-"}\n**Учасників:** ${participants.length}\n${winners.length?`**Переможців:** ${winners.length}\n\n`:"\n"}${statusText}`)],components:[]}).catch(()=>{});
+      }
+    }
+  }catch(e){console.error("Giveaway finish message edit failed:",e);}
+  return {discordSent,discordError,winnersText};
+}
+
 app.post("/api/giveaways", protect, async (req,res)=>{
   try{
     const db=readDb();
@@ -3363,52 +3517,15 @@ app.post("/api/giveaways/:id/pick-winners", protect, async (req,res)=>{
     g.finishedAt = now();
     writeDb(db);
 
-    const winnersText = winners.map((w,i)=>`**${i+1}.** ${w.userId ? `<@${w.userId}>` : w.username || w.name || "Учасник"} ${w.username ? `(${w.username})` : ""}`).join("\n");
-    const desc =
-      `**Приз:** ${g.prize||"-"}\n`+
-      `**Кількість переможців:** ${winners.length}\n\n`+
-      winnersText;
-
-    let discordSent = false;
-    let discordError = "";
-    try{
-      const ch = await channel(CONFIG.channels.giveawayWinners || "1505075996100137110");
-      if(!ch){
-        discordError = `Канал переможців не знайдено: ${CONFIG.channels.giveawayWinners}`;
-      }else{
-        await ch.send({embeds:[embed("🏆 Переможці розіграшу: "+(g.title||"-"), desc)]});
-        discordSent = true;
-      }
-    }catch(e){
-      discordError = e.message || String(e);
-      console.error("Giveaway winners send failed:", e);
-    }
+    const {discordSent,discordError,winnersText}=await finalizeGiveawayDiscord(g,winners);
 
     let calendarSent = false;
     if(typeof sendForbesCalendarCopy === "function"){
-      calendarSent = await sendForbesCalendarCopy("📅 Переможці розіграшу: "+(g.title||"-"), desc);
-    }
+      const desc=`**Приз:** ${g.prize||"-"}
+**Кількість переможців:** ${winners.length}
 
-    // Disable "Участвую" button in original giveaway message and mark finished.
-    try{
-      if(g.messageId && CONFIG.channels.giveawayActive){
-        const activeCh = await channel(CONFIG.channels.giveawayActive);
-        const msg = activeCh ? await activeCh.messages.fetch(g.messageId).catch(()=>null) : null;
-        if(msg){
-          await msg.edit({
-            embeds:[embed("🎁 "+(g.title||"Розіграш")+" — завершено",
-              `**Приз:** ${g.prize||"-"}\n`+
-              `**Учасників:** ${participants.length}\n`+
-              `**Переможців:** ${winners.length}\n\n`+
-              `🏁 **Розіграш завершено**\n\n`+
-              winnersText
-            )],
-            components:[]
-          }).catch(()=>{});
-        }
-      }
-    }catch(e){
-      console.error("Giveaway finish message edit failed:", e);
+${winnersText}`;
+      calendarSent = await sendForbesCalendarCopy("📅 Переможці розіграшу: "+(g.title||"-"), desc);
     }
 
     res.json({ok:true,giveaway:g,winners,discordSent,discordError,calendarSent,calendarChannelId:CONFIG.channels.calendar});
@@ -3416,6 +3533,53 @@ app.post("/api/giveaways/:id/pick-winners", protect, async (req,res)=>{
     console.error("POST /api/giveaways/:id/pick-winners failed:", e);
     res.status(500).json({ok:false,error:"pick_winners_failed",message:e.message});
   }
+});
+
+app.post("/api/giveaways/:id/manual-winner", protect, async (req,res)=>{
+  try{
+    const db=readDb(); db.giveaways=Array.isArray(db.giveaways)?db.giveaways:[];
+    const g=db.giveaways.find(x=>String(x.id)===String(req.params.id));
+    if(!g)return res.status(404).json({ok:false,error:"giveaway_not_found",message:"Розіграш не знайдено."});
+    const nickname=String(req.body.nickname||req.body.nick||"").trim();
+    const staticId=String(req.body.staticId||req.body.playerId||"").trim();
+    if(!nickname&&!staticId)return res.status(400).json({ok:false,error:"winner_required",message:"Вкажи нік або Static ID переможця."});
+    const member=await findDiscordMemberForRecord({nickname,staticId,discordUserId:req.body.discordUserId||""}).catch(()=>null);
+    const winner={userId:member?.id||req.body.discordUserId||"",nickname:member?.displayName||nickname||member?.user?.username||"Учасник",username:member?.user?.username||"",staticId,selectedManually:true,selectedAt:now()};
+    g.winners=[winner]; g.winnersCount=1; g.status="finished"; g.finishedAt=now(); g.manualWinner=true;
+    writeDb(db);
+    const {discordSent,discordError}=await finalizeGiveawayDiscord(g,[winner]);
+    res.json({ok:true,giveaway:g,winners:[winner],discordSent,discordError});
+  }catch(e){console.error("manual giveaway winner failed:",e);res.status(500).json({ok:false,error:"manual_winner_failed",message:e.message});}
+});
+
+app.post("/api/giveaways/:id/close", protect, async (req,res)=>{
+  try{
+    const db=readDb(); db.giveaways=Array.isArray(db.giveaways)?db.giveaways:[];
+    const g=db.giveaways.find(x=>String(x.id)===String(req.params.id));
+    if(!g)return res.status(404).json({ok:false,error:"giveaway_not_found",message:"Розіграш не знайдено."});
+    g.status="closed"; g.closedAt=now(); g.closedBy=req.user?.username||req.user?.name||"";
+    writeDb(db);
+    await finalizeGiveawayDiscord(g,[],{closedWithoutWinner:true});
+    res.json({ok:true,giveaway:g});
+  }catch(e){console.error("close giveaway failed:",e);res.status(500).json({ok:false,error:"giveaway_close_failed",message:e.message});}
+});
+
+app.delete("/api/giveaways/:id", protect, async (req,res)=>{
+  try{
+    const db=readDb(); db.giveaways=Array.isArray(db.giveaways)?db.giveaways:[];
+    const idx=db.giveaways.findIndex(x=>String(x.id)===String(req.params.id));
+    if(idx<0)return res.status(404).json({ok:false,error:"giveaway_not_found",message:"Розіграш не знайдено."});
+    const [g]=db.giveaways.splice(idx,1); writeDb(db);
+    let discordDeleted=false;
+    try{
+      if(g.messageId&&CONFIG.channels.giveawayActive){
+        const ch=await channel(CONFIG.channels.giveawayActive);
+        const msg=ch?await ch.messages.fetch(g.messageId).catch(()=>null):null;
+        if(msg){await msg.delete().catch(()=>{});discordDeleted=true;}
+      }
+    }catch(e){console.error("giveaway discord delete failed:",e);}
+    res.json({ok:true,id:req.params.id,discordDeleted});
+  }catch(e){console.error("delete giveaway failed:",e);res.status(500).json({ok:false,error:"giveaway_delete_failed",message:e.message});}
 });
 
 app.get("/api/family-stats", protect, async (req,res)=>{

@@ -3841,3 +3841,6 @@ initDb()
 function canManageComplaints(member,req){ return forbes2026Complaints(member,req); }
 
 function isComplaintAdmin(member,req){ return forbes2026Complaints(member,req); }
+
+/* V16 auth diagnostic: signed tokens have no expiry */
+app.get('/api/auth/status', protect, (req,res)=>res.json({ok:true,authenticated:true,userId:String(req.user?.id||''),tokenExpiry:null,serverTime:new Date().toISOString()}));

@@ -11,6 +11,8 @@ const DEFAULT_DB = {
   familyInfo: {},
   siteSettings: {},
   applications: [],
+  birthdays: [],
+  birthdayAnnouncements: [],
   farmReports: [],
   farmReportsArchive: [],
   capts: [],

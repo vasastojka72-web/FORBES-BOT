@@ -650,15 +650,46 @@ app.post("/api/applications", protect, async (req,res)=>{
       startDate:req.body.startDate||"",
       endDate:req.body.endDate||"",
       reason:req.body.reason||"",
+      birthdayDay:Number(req.body.birthdayDay||0),
+      birthdayMonth:Number(req.body.birthdayMonth||0),
       confirmed:Boolean(req.body.confirmed),
       status:"pending",
       createdAt:now()
     };
 
+    const typeLower = String(item.type || "").toLowerCase();
+    const isBirthdayApplication = typeLower.includes("день народ") || typeLower === "birthday";
+    if(isBirthdayApplication){
+      const day=Number(item.birthdayDay);
+      const month=Number(item.birthdayMonth);
+      if(!Number.isInteger(day)||day<1||day>31||!Number.isInteger(month)||month<1||month>12){
+        return res.status(400).json({ok:false,error:"invalid_birthday",message:"Вкажіть правильний день і місяць."});
+      }
+      db.birthdays=Array.isArray(db.birthdays)?db.birthdays:[];
+      const discordId=String(req.user?.id||item.discordUserId||"");
+      const existing=db.birthdays.find(x=>discordId&&String(x.discordUserId||"")===discordId) || db.birthdays.find(x=>String(x.staticId||"")===String(item.staticId||""));
+      const birthday={
+        id:existing?.id||id("birthday"), nickname:item.nickname, staticId:item.staticId, discordUserId:discordId,
+        discordName:item.discordName||item.discord, day, month, enabled:true,
+        createdAt:existing?.createdAt||now(), updatedAt:now()
+      };
+      if(existing) Object.assign(existing,birthday); else db.birthdays.unshift(birthday);
+      writeDb(db);
+      let discordSent=false,discordError="";
+      try{
+        const ch=await channel(CONFIG.channels.birthdays);
+        if(ch){
+          await ch.send({embeds:[embed("🎂 Додано день народження",`**Нік:** ${birthday.nickname}\n**Static ID:** ${birthday.staticId}\n**Discord:** ${birthday.discordUserId?`<@${birthday.discordUserId}>`:birthday.discordName||"-"}\n**Дата:** ${String(day).padStart(2,"0")}.${String(month).padStart(2,"0")}`)],allowedMentions:{users:birthday.discordUserId?[birthday.discordUserId]:[]}});
+          discordSent=true;
+        } else discordError="Канал днів народження не знайдено";
+      }catch(e){discordError=e.message||String(e);}
+      return res.json({ok:true,birthday,application:birthday,discordSent,discordError});
+    }
+
     db.applications.unshift(item);
     writeDb(db);
 
-    const typeLower = String(item.type || "").toLowerCase();
+    
     const chId = typeLower.includes("увал") || typeLower.includes("звіль") || typeLower === "dismissal"
       ? CONFIG.channels.dismissals
       : typeLower.includes("відпуст") || typeLower === "vacation"
@@ -727,6 +758,45 @@ app.post("/api/applications", protect, async (req,res)=>{
   }
 });
 
+
+
+function pragueDateParts(){
+  const parts=new Intl.DateTimeFormat('en-CA',{timeZone:'Europe/Prague',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date());
+  const get=t=>parts.find(x=>x.type===t)?.value||'';
+  return {year:get('year'),month:Number(get('month')),day:Number(get('day')),key:`${get('year')}-${get('month')}-${get('day')}`};
+}
+async function processBirthdayAnnouncements(){
+  if(!client.isReady()) return {sent:0,ready:false};
+  const d=pragueDateParts();
+  const db=readDb();
+  db.birthdays=Array.isArray(db.birthdays)?db.birthdays:[];
+  db.birthdayAnnouncements=Array.isArray(db.birthdayAnnouncements)?db.birthdayAnnouncements:[];
+  const today=db.birthdays.filter(x=>x.enabled!==false&&Number(x.day)===d.day&&Number(x.month)===d.month);
+  let sent=0;
+  const ch=await channel(CONFIG.channels.generalChat).catch(()=>null);
+  if(ch){
+    for(const b of today){
+      const announceKey=`${d.key}:${b.id||b.discordUserId||b.staticId}`;
+      if(db.birthdayAnnouncements.some(x=>x.key===announceKey)) continue;
+      const mention=b.discordUserId?`<@${b.discordUserId}>`:`**${b.nickname} [${b.staticId}]**`;
+      await ch.send({content:`@everyone 🎉 Сьогодні у ${mention} день народження! Давайте привітаємо його! 🎂`,allowedMentions:{parse:['everyone'],users:b.discordUserId?[String(b.discordUserId)]:[]}});
+      db.birthdayAnnouncements.push({key:announceKey,birthdayId:b.id,date:d.key,sentAt:now()});
+      sent++;
+    }
+    if(sent) writeDb(db);
+  }
+  return {sent,ready:true,today};
+}
+app.get('/api/birthdays/today', async(req,res)=>{
+  try{
+    const result=await processBirthdayAnnouncements();
+    const d=pragueDateParts();
+    const db=readDb();
+    const viewer=String(req.query.viewerDiscordId||'');
+    const birthdays=(Array.isArray(db.birthdays)?db.birthdays:[]).filter(x=>x.enabled!==false&&Number(x.day)===d.day&&Number(x.month)===d.month).map(x=>({nickname:x.nickname,staticId:x.staticId,isViewer:Boolean(viewer&&String(x.discordUserId||'')===viewer)}));
+    res.json({ok:true,date:d.key,birthdays,announcementsSent:result.sent,botReady:result.ready});
+  }catch(e){console.error('birthday today failed',e);res.status(500).json({ok:false,error:'birthday_today_failed',message:e.message});}
+});
 
 function safeRemoteMediaUrl(value){
   const v=String(value||"").trim();

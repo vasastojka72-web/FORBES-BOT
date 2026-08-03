@@ -60,7 +60,9 @@ export const CONFIG = {
   blacklist: "1505075615873896488",
     playerCheck: "1505075781494374471",
     giveawayActive: "1505075955247349840",
-    giveawayWinners: "1505075996100137110"
+    giveawayWinners: "1505075996100137110",
+    birthdays: "1533936489262747699",
+    generalChat: "1504875096484085984"
   },
 
   payout: {

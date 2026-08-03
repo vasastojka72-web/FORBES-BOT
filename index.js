@@ -3483,13 +3483,29 @@ app.post("/api/giveaways", protect, async (req,res)=>{
   }
 });
 
-app.get("/api/giveaways", protect, async (req,res)=>{
+app.get("/api/giveaways", async (req,res)=>{
   try{
     const db=readDb();
     const giveaways = (Array.isArray(db.giveaways) ? db.giveaways : []).map(g=>({
-      ...g,
-      participantsCount: Array.isArray(g.participants) ? g.participants.length : 0
+      id:g.id,
+      title:g.title||"",
+      prize:g.prize||"",
+      rules:g.rules||"",
+      status:g.status||"active",
+      created:g.created||g.createdAt||"",
+      createdAt:g.createdAt||g.created||"",
+      finishedAt:g.finishedAt||"",
+      closedAt:g.closedAt||"",
+      messageId:g.messageId||"",
+      participantsCount:Array.isArray(g.participants)?g.participants.length:Number(g.participantsCount||0),
+      winners:Array.isArray(g.winners)?g.winners.map(w=>({
+        userId:w.userId||"",
+        nickname:w.nickname||w.nick||w.displayName||w.username||"Учасник",
+        username:w.username||"",
+        staticId:w.staticId||w.playerId||""
+      })):[]
     }));
+    res.set("Cache-Control","no-store");
     res.json({ok:true,giveaways,count:giveaways.length});
   }catch(e){res.status(500).json({ok:false,error:"giveaways_get_failed",message:e.message});}
 });

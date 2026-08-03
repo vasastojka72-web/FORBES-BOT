@@ -1,0 +1,1 @@
+V24: dedicated authenticated /api/birthdays endpoint with validation and Discord delivery.

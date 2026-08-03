@@ -625,6 +625,79 @@ app.delete("/api/contracts/:id", protect, ownerOnly, async (req,res)=>{
   }
 });
 
+
+
+// V25 — owner birthday management
+app.get("/api/admin/birthdays", protect, ownerOnly, async (req,res)=>{
+  try{
+    const db=readDb();
+    const birthdays=(Array.isArray(db.birthdays)?db.birthdays:[])
+      .slice()
+      .sort((a,b)=>(Number(a.month)-Number(b.month))||(Number(a.day)-Number(b.day))||String(a.nickname||"").localeCompare(String(b.nickname||"")));
+    res.json({ok:true,birthdays});
+  }catch(e){res.status(500).json({ok:false,error:"birthday_list_failed",message:e.message});}
+});
+
+app.put("/api/admin/birthdays/:id", protect, ownerOnly, async (req,res)=>{
+  try{
+    const db=readDb(); db.birthdays=Array.isArray(db.birthdays)?db.birthdays:[];
+    const item=db.birthdays.find(x=>String(x.id)===String(req.params.id));
+    if(!item)return res.status(404).json({ok:false,error:"birthday_not_found",message:"Запис дня народження не знайдено."});
+    const nickname=String(req.body.nickname||"").trim();
+    const staticId=String(req.body.staticId||"").trim();
+    const day=Number(req.body.day||req.body.birthdayDay||0);
+    const month=Number(req.body.month||req.body.birthdayMonth||0);
+    if(!nickname)return res.status(400).json({ok:false,error:"nickname_required",message:"Вкажи нік."});
+    if(!staticId)return res.status(400).json({ok:false,error:"static_id_required",message:"Вкажи Static ID."});
+    if(!Number.isInteger(day)||day<1||day>31||!Number.isInteger(month)||month<1||month>12)return res.status(400).json({ok:false,error:"invalid_birthday",message:"Вкажи правильний день і місяць."});
+    item.nickname=nickname; item.staticId=staticId; item.day=day; item.month=month;
+    item.enabled=req.body.enabled!==false; item.updatedAt=now(); item.updatedBy=String(req.user?.id||"");
+    const wr=await writeDbAsync(db); if(!wr.ok)return res.status(500).json({ok:false,error:"birthday_db_write_failed",message:wr.error||"Не вдалося зберегти."});
+    try{const ch=await channel(CONFIG.channels.birthdays);if(ch)await ch.send({embeds:[embed("✏️ День народження відредаговано",`**Нік:** ${item.nickname}
+**Static ID:** ${item.staticId}
+**Дата:** ${String(day).padStart(2,"0")}.${String(month).padStart(2,"0")}
+**Змінив:** <@${req.user.id}>`)],allowedMentions:{users:[String(req.user.id)]}});}catch(e){console.warn("birthday edit discord skipped",e.message)}
+    res.json({ok:true,birthday:item});
+  }catch(e){res.status(500).json({ok:false,error:"birthday_update_failed",message:e.message});}
+});
+
+app.delete("/api/admin/birthdays/:id", protect, ownerOnly, async (req,res)=>{
+  try{
+    const db=readDb(); db.birthdays=Array.isArray(db.birthdays)?db.birthdays:[];
+    const item=db.birthdays.find(x=>String(x.id)===String(req.params.id));
+    if(!item)return res.status(404).json({ok:false,error:"birthday_not_found",message:"Запис дня народження не знайдено."});
+    db.birthdays=db.birthdays.filter(x=>x!==item);
+    db.birthdayAnnouncements=(Array.isArray(db.birthdayAnnouncements)?db.birthdayAnnouncements:[]).filter(x=>String(x.birthdayId)!==String(item.id));
+    const wr=await writeDbAsync(db); if(!wr.ok)return res.status(500).json({ok:false,error:"birthday_db_write_failed",message:wr.error||"Не вдалося видалити."});
+    res.json({ok:true,deleted:item.id});
+  }catch(e){res.status(500).json({ok:false,error:"birthday_delete_failed",message:e.message});}
+});
+
+app.post("/api/birthdays", protect, async (req,res)=>{
+  try{
+    const nickname=String(req.body.nickname||req.body.nick||"").trim();
+    const staticId=String(req.body.staticId||req.body.playerId||"").trim();
+    const day=Number(req.body.birthdayDay||req.body.day||0);
+    const month=Number(req.body.birthdayMonth||req.body.month||0);
+    if(!nickname) return res.status(400).json({ok:false,error:"nickname_required",message:"Вкажи RP-нік."});
+    if(!staticId) return res.status(400).json({ok:false,error:"static_id_required",message:"Вкажи Static ID."});
+    if(!Number.isInteger(day)||day<1||day>31||!Number.isInteger(month)||month<1||month>12) return res.status(400).json({ok:false,error:"invalid_birthday",message:"Вкажи правильний день і місяць."});
+    const db=readDb(); db.birthdays=Array.isArray(db.birthdays)?db.birthdays:[];
+    const discordId=String(req.user?.id||req.body.discordUserId||"");
+    const existing=db.birthdays.find(x=>discordId&&String(x.discordUserId||"")===discordId)||db.birthdays.find(x=>String(x.staticId||"")===staticId);
+    const birthday={id:existing?.id||id("birthday"),nickname,staticId,discordUserId:discordId,discordName:req.body.discordName||req.body.discord||"",day,month,enabled:true,createdAt:existing?.createdAt||now(),updatedAt:now()};
+    if(existing)Object.assign(existing,birthday);else db.birthdays.unshift(birthday);
+    const wr=typeof writeDbAsync==="function"?await writeDbAsync(db):(writeDb(db),{ok:true});
+    if(!wr.ok)return res.status(500).json({ok:false,error:"birthday_db_write_failed",message:wr.error||"Не вдалося зберегти."});
+    let discordSent=false,discordError="";
+    try{const ch=await channel(CONFIG.channels.birthdays);if(ch){await ch.send({embeds:[embed("🎂 Додано день народження",`**Нік:** ${birthday.nickname}
+**Static ID:** ${birthday.staticId}
+**Discord:** ${birthday.discordUserId?`<@${birthday.discordUserId}>`:birthday.discordName||"-"}
+**Дата:** ${String(day).padStart(2,"0")}.${String(month).padStart(2,"0")}`)],allowedMentions:{users:birthday.discordUserId?[birthday.discordUserId]:[]}});discordSent=true}else discordError="Канал днів народження не знайдено"}catch(e){discordError=e.message||String(e)}
+    res.json({ok:true,birthday,application:birthday,discordSent,discordError});
+  }catch(e){console.error("birthday post failed",e);res.status(500).json({ok:false,error:"birthday_post_failed",message:e.message})}
+});
+
 app.post("/api/applications", protect, async (req,res)=>{
   try{
     const db=readDb();

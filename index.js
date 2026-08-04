@@ -8,7 +8,7 @@ import cron from "node-cron";
 import { Client, GatewayIntentBits, Partials, EmbedBuilder, AttachmentBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, REST, Routes, SlashCommandBuilder } from "discord.js";
 import { CONFIG } from "./config.js";
 import {readDb, writeDb, writeDbAsync, id, initDb, getDbInfo} from "./storage.js";
-import {ensureMediaSystem, uploadBase64Media, deleteMedia, getMediaPublicUrl, MEDIA_PATHS, mediaConfigured} from "./media-storage.js";
+import {ensureMediaSystem, uploadBase64Media, deleteMedia, getMediaPublicUrl, MEDIA_PATHS, mediaConfigured, downloadMedia} from "./media-storage.js";
 
 
 process.on("unhandledRejection", (err)=>console.error("UNHANDLED REJECTION:", err));
@@ -4214,6 +4214,23 @@ async function chargeReportPayload(report){
   ])]:[];
   return {embeds:[e],components};
 }
+
+app.get('/api/charge/items/:id/image', async(req,res)=>{
+  try{
+    const db=chargeEnsureDb(readDb());
+    const item=db.chargeItems.find(x=>String(x.id)===String(req.params.id)&&x.active!==false);
+    if(!item||!item.imageBucket||!item.imagePath)return res.status(404).end();
+    const blob=await downloadMedia(item.imageBucket,item.imagePath);
+    const buf=Buffer.from(await blob.arrayBuffer());
+    res.set('Content-Type',blob.type||'image/png');
+    res.set('Cache-Control','public, max-age=86400, stale-while-revalidate=604800');
+    res.set('Cross-Origin-Resource-Policy','cross-origin');
+    return res.send(buf);
+  }catch(e){
+    console.error('charge image load failed',e?.message||e);
+    return res.status(404).end();
+  }
+});
 
 app.get('/api/charge/items', protect, async(req,res)=>{
   const member=await requireFamilyRole(req,res); if(!member)return;

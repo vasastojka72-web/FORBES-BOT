@@ -61,5 +61,13 @@ export async function createMediaSignedUrl(bucket,path,expiresIn=3600){
   return data?.signedUrl||"";
 }
 
+
+export async function downloadMedia(bucket,path){
+  if(!mediaSupabase||!bucket||!path) throw new Error("Supabase Storage не налаштований");
+  const {data,error}=await mediaSupabase.storage.from(bucket).download(path);
+  if(error) throw error;
+  return data;
+}
+
 export async function deleteMedia(bucket,path){if(!mediaSupabase||!bucket||!path)return; const {error}=await mediaSupabase.storage.from(bucket).remove([path]); if(error) throw error;}
 export const MEDIA_PATHS={car:`${IMAGE_BUCKET}/cars`,estate:`${IMAGE_BUCKET}/estate`,office:`${IMAGE_BUCKET}/office`,gallery:`${IMAGE_BUCKET}/gallery`,family:`${IMAGE_BUCKET}/family`,leadership:`${IMAGE_BUCKET}/leadership`,history:`${IMAGE_BUCKET}/history`,charge:`${IMAGE_BUCKET}/charge-items`,track:`${MUSIC_BUCKET}/tracks`,cover:`${MUSIC_BUCKET}/covers`};

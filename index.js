@@ -4233,7 +4233,11 @@ app.get('/api/charge/items/:id/image', async(req,res)=>{
 });
 
 app.get('/api/charge/items', protect, async(req,res)=>{
-  const member=await requireFamilyRole(req,res); if(!member)return;
+  // V32: charge items are available to every authenticated guild account.
+  // Do not require a separate visible Discord role here: some regular members
+  // have access to the panel but were rejected by requireFamilyRole(), so they
+  // received an empty items grid.
+  const member=await apiMemberOr403(req,res); if(!member)return;
   const db=chargeEnsureDb(readDb());
   const source=db.chargeItems.filter(x=>x.active!==false).sort((a,b)=>(a.order||0)-(b.order||0));
   const items=source.map(item=>{
@@ -4267,7 +4271,7 @@ app.delete('/api/charge/items/:id', protect, ownerOnly, async(req,res)=>{
   try{const db=chargeEnsureDb(readDb());const i=db.chargeItems.findIndex(x=>String(x.id)===String(req.params.id));if(i<0)return res.status(404).json({ok:false,error:'not_found'});const [item]=db.chargeItems.splice(i,1);await writeDbAsync(db);if(item.imageBucket&&item.imagePath)deleteMedia(item.imageBucket,item.imagePath).catch(()=>{});res.json({ok:true});}catch(e){res.status(500).json({ok:false,error:'charge_item_delete_failed',message:e.message});}
 });
 app.post('/api/charge/reports', protect, async(req,res)=>{
-  try{const member=await requireFamilyRole(req,res);if(!member)return;const db=chargeEnsureDb(readDb());
+  try{const member=await apiMemberOr403(req,res);if(!member)return;const db=chargeEnsureDb(readDb());
     const giverNick=String(req.body.giverNick||'').trim(),giverStaticId=String(req.body.giverStaticId||'').trim(),receiverNick=String(req.body.receiverNick||'').trim(),receiverStaticId=String(req.body.receiverStaticId||'').trim();const items=chargeCleanItems(req.body.items);
     if(!giverNick||!giverStaticId||!receiverNick||!receiverStaticId||!items.length)return res.status(400).json({ok:false,error:'required_fields',message:'Заповни хто видав, хто отримав і вибери хоча б один предмет.'});
     const report={id:id('charge_report'),giverNick,giverStaticId,receiverNick,receiverStaticId,items,status:'pending',submittedByDiscordId:String(req.user?.id||''),submittedByName:member.displayName||member.user?.username||'Учасник',createdAt:now(),createdAtIso:new Date().toISOString()};
@@ -4277,8 +4281,20 @@ app.post('/api/charge/reports', protect, async(req,res)=>{
   }catch(e){console.error('charge report create failed',e);res.status(500).json({ok:false,error:'charge_report_create_failed',message:e.message});}
 });
 app.get('/api/charge/reports', protect, async(req,res)=>{
-  const member=await requireFamilyRole(req,res);if(!member)return;const db=chargeEnsureDb(readDb());const staff=chargeIsStaff(member,req);const uid=String(req.user?.id||'');
-  res.json({ok:true,reports:(staff?db.chargeReports:db.chargeReports.filter(x=>String(x.submittedByDiscordId||'')===uid)).slice(0,300),canModerate:staff,canEditItems:chargeIsOwnerReq(req)});
+  // V32: shared charge history is visible to every authenticated guild account.
+  const member=await apiMemberOr403(req,res);
+  if(!member)return;
+  const db=chargeEnsureDb(readDb());
+  const staff=chargeIsStaff(member,req);
+  // Усі учасники сім'ї бачать спільну історію звітів заряду.
+  // Раніше звичайним учасникам повертались тільки власні звіти,
+  // тому старий звіт іншої людини виглядав як зниклий/порожній.
+  res.json({
+    ok:true,
+    reports:db.chargeReports.slice(0,300),
+    canModerate:staff,
+    canEditItems:chargeIsOwnerReq(req)
+  });
 });
 app.put('/api/charge/reports/:id', protect, async(req,res)=>{
   try{const member=await requireFamilyRole(req,res);if(!member)return;if(!chargeIsStaff(member,req))return res.status(403).json({ok:false,error:'no_permission'});const db=chargeEnsureDb(readDb());const r=db.chargeReports.find(x=>String(x.id)===String(req.params.id));if(!r)return res.status(404).json({ok:false,error:'not_found'});

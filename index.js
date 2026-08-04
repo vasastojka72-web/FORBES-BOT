@@ -4180,6 +4180,89 @@ function forbes2026Capt(member,req){ return forbes2026Full(member,req)||forbes20
 function forbes2026Discipline(member,req){ return forbes2026Farm(member,req)||forbes2026Capt(member,req); }
 function forbes2026Complaints(member,req){ return forbes2026Full(member,req)||forbes2026HasId(member,[FORBES_ACCESS_ROLE_IDS_2026.complaintAdmin])||forbes2026HasName(member,['адміністратор скарг']); }
 
+
+
+/* === V26 CHARGE REPORTS / OWNER ITEM CONSTRUCTOR === */
+function chargeEnsureDb(db){
+  db.chargeItems=Array.isArray(db.chargeItems)?db.chargeItems:[];
+  db.chargeReports=Array.isArray(db.chargeReports)?db.chargeReports:[];
+  return db;
+}
+function chargeIsStaff(member,req){ return forbes2026Capt(member,req)||forbes2026Full(member,req); }
+function chargeIsOwnerReq(req){ return String(req.user?.id||'')===String(CONFIG.ownerId); }
+function chargeCleanItems(items){
+  return (Array.isArray(items)?items:[]).map(x=>({
+    itemId:String(x.itemId||x.id||''), name:String(x.name||'').trim().slice(0,80), quantity:Math.max(1,Math.min(1000000,Number(x.quantity||0)))
+  })).filter(x=>x.itemId&&x.name&&x.quantity>0).slice(0,50);
+}
+function chargeStatusLabel(s){return ({pending:'🟡 Очікує перевірки',approved:'✅ Одобрено',rejected:'❌ Відхилено',fraud:'⚠️ Обман'})[s]||'🟡 Очікує перевірки';}
+async function chargeReportPayload(report){
+  const giverMember=await findDiscordMemberForRecord({nickname:report.giverNick,staticId:report.giverStaticId}).catch(()=>null);
+  const receiverMember=await findDiscordMemberForRecord({nickname:report.receiverNick,staticId:report.receiverStaticId}).catch(()=>null);
+  const giver=giverMember?`<@${giverMember.id}>`:`${report.giverNick} | ID ${report.giverStaticId}`;
+  const receiver=receiverMember?`<@${receiverMember.id}>`:`${report.receiverNick} | ID ${report.receiverStaticId}`;
+  const itemText=(report.items||[]).map(x=>`• **${x.name}:** ${x.quantity}`).join('\n')||'—';
+  const e=embed('📦 Звіт заряду FORBES',`**Хто видав:** ${giver}\n**Хто отримав:** ${receiver}\n**Хто подав звіт:** <@${report.submittedByDiscordId}>\n\n**Предмети:**\n${itemText}\n\n**Статус:** ${chargeStatusLabel(report.status)}${report.reviewComment?`\n**Коментар:** ${report.reviewComment}`:''}`);
+  const components=report.status==='pending'?[row([
+    {id:`charge_approve:${report.id}`,label:'✅ Одобрити',style:ButtonStyle.Success},
+    {id:`charge_reject:${report.id}`,label:'❌ Відхилити',style:ButtonStyle.Danger},
+    {id:`charge_fraud:${report.id}`,label:'⚠️ Обман',style:ButtonStyle.Secondary}
+  ])]:[];
+  return {embeds:[e],components};
+}
+
+app.get('/api/charge/items', protect, async(req,res)=>{
+  const member=await requireFamilyRole(req,res); if(!member)return;
+  const db=chargeEnsureDb(readDb());
+  res.json({ok:true,items:db.chargeItems.filter(x=>x.active!==false).sort((a,b)=>(a.order||0)-(b.order||0)),canEditItems:chargeIsOwnerReq(req)});
+});
+app.post('/api/charge/items', protect, ownerOnly, async(req,res)=>{
+  try{
+    const db=chargeEnsureDb(readDb()); const name=String(req.body.name||'').trim();
+    if(!name)return res.status(400).json({ok:false,error:'name_required'});
+    const item={id:id('charge_item'),name:name.slice(0,80),imageUrl:String(req.body.imageUrl||''),imageBucket:String(req.body.imageBucket||''),imagePath:String(req.body.imagePath||''),order:Number(req.body.order??db.chargeItems.length),active:true,createdAt:now(),createdBy:String(req.user?.id||'')};
+    db.chargeItems.push(item); await writeDbAsync(db); res.json({ok:true,item});
+  }catch(e){res.status(500).json({ok:false,error:'charge_item_create_failed',message:e.message});}
+});
+app.put('/api/charge/items/:id', protect, ownerOnly, async(req,res)=>{
+  try{const db=chargeEnsureDb(readDb());const item=db.chargeItems.find(x=>String(x.id)===String(req.params.id));if(!item)return res.status(404).json({ok:false,error:'not_found'});
+    if(req.body.name!==undefined)item.name=String(req.body.name||'').trim().slice(0,80);
+    ['imageUrl','imageBucket','imagePath'].forEach(k=>{if(req.body[k]!==undefined)item[k]=String(req.body[k]||'');});
+    if(req.body.order!==undefined)item.order=Number(req.body.order||0); if(req.body.active!==undefined)item.active=Boolean(req.body.active); item.updatedAt=now();
+    await writeDbAsync(db);res.json({ok:true,item});}catch(e){res.status(500).json({ok:false,error:'charge_item_update_failed',message:e.message});}
+});
+app.delete('/api/charge/items/:id', protect, ownerOnly, async(req,res)=>{
+  try{const db=chargeEnsureDb(readDb());const i=db.chargeItems.findIndex(x=>String(x.id)===String(req.params.id));if(i<0)return res.status(404).json({ok:false,error:'not_found'});const [item]=db.chargeItems.splice(i,1);await writeDbAsync(db);if(item.imageBucket&&item.imagePath)deleteMedia(item.imageBucket,item.imagePath).catch(()=>{});res.json({ok:true});}catch(e){res.status(500).json({ok:false,error:'charge_item_delete_failed',message:e.message});}
+});
+app.post('/api/charge/reports', protect, async(req,res)=>{
+  try{const member=await requireFamilyRole(req,res);if(!member)return;const db=chargeEnsureDb(readDb());
+    const giverNick=String(req.body.giverNick||'').trim(),giverStaticId=String(req.body.giverStaticId||'').trim(),receiverNick=String(req.body.receiverNick||'').trim(),receiverStaticId=String(req.body.receiverStaticId||'').trim();const items=chargeCleanItems(req.body.items);
+    if(!giverNick||!giverStaticId||!receiverNick||!receiverStaticId||!items.length)return res.status(400).json({ok:false,error:'required_fields',message:'Заповни хто видав, хто отримав і вибери хоча б один предмет.'});
+    const report={id:id('charge_report'),giverNick,giverStaticId,receiverNick,receiverStaticId,items,status:'pending',submittedByDiscordId:String(req.user?.id||''),submittedByName:member.displayName||member.user?.username||'Учасник',createdAt:now(),createdAtIso:new Date().toISOString()};
+    db.chargeReports.unshift(report);await writeDbAsync(db);
+    const ch=await channel(CONFIG.channels.chargeReports||'1533952822775779419');if(ch){const msg=await ch.send(await chargeReportPayload(report));report.discordMessageId=msg.id;report.discordChannelId=ch.id;await writeDbAsync(db);}
+    res.json({ok:true,report});
+  }catch(e){console.error('charge report create failed',e);res.status(500).json({ok:false,error:'charge_report_create_failed',message:e.message});}
+});
+app.get('/api/charge/reports', protect, async(req,res)=>{
+  const member=await requireFamilyRole(req,res);if(!member)return;const db=chargeEnsureDb(readDb());const staff=chargeIsStaff(member,req);const uid=String(req.user?.id||'');
+  res.json({ok:true,reports:(staff?db.chargeReports:db.chargeReports.filter(x=>String(x.submittedByDiscordId||'')===uid)).slice(0,300),canModerate:staff,canEditItems:chargeIsOwnerReq(req)});
+});
+app.put('/api/charge/reports/:id', protect, async(req,res)=>{
+  try{const member=await requireFamilyRole(req,res);if(!member)return;if(!chargeIsStaff(member,req))return res.status(403).json({ok:false,error:'no_permission'});const db=chargeEnsureDb(readDb());const r=db.chargeReports.find(x=>String(x.id)===String(req.params.id));if(!r)return res.status(404).json({ok:false,error:'not_found'});
+    ['giverNick','giverStaticId','receiverNick','receiverStaticId'].forEach(k=>{if(req.body[k]!==undefined)r[k]=String(req.body[k]||'').trim();});if(req.body.items!==undefined)r.items=chargeCleanItems(req.body.items);if(req.body.status!==undefined&&['pending','approved','rejected','fraud'].includes(req.body.status))r.status=req.body.status;if(req.body.reviewComment!==undefined)r.reviewComment=String(req.body.reviewComment||'').slice(0,500);r.reviewedByDiscordId=String(req.user?.id||'');r.reviewedByName=member.displayName||member.user?.username||'';r.reviewedAt=now();await writeDbAsync(db);
+    if(r.discordMessageId&&r.discordChannelId){const ch=await channel(r.discordChannelId);const msg=ch?await ch.messages.fetch(r.discordMessageId).catch(()=>null):null;if(msg)await msg.edit(await chargeReportPayload(r)).catch(()=>{});}res.json({ok:true,report:r});
+  }catch(e){res.status(500).json({ok:false,error:'charge_report_update_failed',message:e.message});}
+});
+app.delete('/api/charge/reports/:id', protect, async(req,res)=>{
+  try{const member=await requireFamilyRole(req,res);if(!member)return;if(!chargeIsStaff(member,req))return res.status(403).json({ok:false,error:'no_permission'});const db=chargeEnsureDb(readDb());const i=db.chargeReports.findIndex(x=>String(x.id)===String(req.params.id));if(i<0)return res.status(404).json({ok:false,error:'not_found'});const [r]=db.chargeReports.splice(i,1);await writeDbAsync(db);if(r.discordMessageId&&r.discordChannelId){const ch=await channel(r.discordChannelId);const msg=ch?await ch.messages.fetch(r.discordMessageId).catch(()=>null):null;if(msg)await msg.delete().catch(()=>{});}res.json({ok:true});
+  }catch(e){res.status(500).json({ok:false,error:'charge_report_delete_failed',message:e.message});}
+});
+client.on('interactionCreate',async interaction=>{
+  try{if(!interaction.isButton()||!String(interaction.customId).startsWith('charge_'))return;const [action,reportId]=interaction.customId.split(':');const member=await interactionMember(interaction);if(!chargeIsStaff(member,null))return denyNoPerm(interaction,'❌ Цю дію можуть виконувати тільки старші каптьори, зами та лідер.');const map={charge_approve:'approved',charge_reject:'rejected',charge_fraud:'fraud'};const status=map[action];if(!status)return;const db=chargeEnsureDb(readDb());const r=db.chargeReports.find(x=>String(x.id)===String(reportId));if(!r)return interaction.reply({content:'❌ Звіт не знайдено.',ephemeral:true});r.status=status;r.reviewedByDiscordId=interaction.user.id;r.reviewedByName=member.displayName||interaction.user.username;r.reviewedAt=now();await writeDbAsync(db);await interaction.update(await chargeReportPayload(r));}
+  catch(e){console.error('charge button failed',e);if(!interaction.replied&&!interaction.deferred)interaction.reply({content:'❌ Помилка обробки.',ephemeral:true}).catch(()=>{});}
+});
+
 app.listen(PORT, ()=>{
   console.log(`✅ API running on port ${PORT}`);
 });

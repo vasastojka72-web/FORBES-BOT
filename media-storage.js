@@ -17,6 +17,7 @@ const KIND_MAP = {
   family:{bucket:IMAGE_BUCKET,folder:"family",mimes:IMAGE_MIMES,max:10*1024*1024},
   leadership:{bucket:IMAGE_BUCKET,folder:"leadership",mimes:IMAGE_MIMES,max:10*1024*1024},
   history:{bucket:IMAGE_BUCKET,folder:"history",mimes:IMAGE_MIMES,max:10*1024*1024},
+  charge:{bucket:IMAGE_BUCKET,folder:"charge-items",mimes:IMAGE_MIMES,max:10*1024*1024},
   cover:{bucket:MUSIC_BUCKET,folder:"covers",mimes:IMAGE_MIMES,max:10*1024*1024},
   track:{bucket:MUSIC_BUCKET,folder:"tracks",mimes:MUSIC_MIMES,max:25*1024*1024}
 };
@@ -47,4 +48,4 @@ export async function uploadBase64Media(kind,file){
   return {bucket:rule.bucket,path,publicUrl:data.publicUrl,name:file.name||`${base}.${ext}`,mimeType:mime,size:buf.length,kind};
 }
 export async function deleteMedia(bucket,path){if(!mediaSupabase||!bucket||!path)return; const {error}=await mediaSupabase.storage.from(bucket).remove([path]); if(error) throw error;}
-export const MEDIA_PATHS={car:`${IMAGE_BUCKET}/cars`,estate:`${IMAGE_BUCKET}/estate`,office:`${IMAGE_BUCKET}/office`,gallery:`${IMAGE_BUCKET}/gallery`,family:`${IMAGE_BUCKET}/family`,leadership:`${IMAGE_BUCKET}/leadership`,history:`${IMAGE_BUCKET}/history`,track:`${MUSIC_BUCKET}/tracks`,cover:`${MUSIC_BUCKET}/covers`};
+export const MEDIA_PATHS={car:`${IMAGE_BUCKET}/cars`,estate:`${IMAGE_BUCKET}/estate`,office:`${IMAGE_BUCKET}/office`,gallery:`${IMAGE_BUCKET}/gallery`,family:`${IMAGE_BUCKET}/family`,leadership:`${IMAGE_BUCKET}/leadership`,history:`${IMAGE_BUCKET}/history`,charge:`${IMAGE_BUCKET}/charge-items`,track:`${MUSIC_BUCKET}/tracks`,cover:`${MUSIC_BUCKET}/covers`};

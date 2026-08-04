@@ -62,7 +62,8 @@ export const CONFIG = {
     giveawayActive: "1505075955247349840",
     giveawayWinners: "1505075996100137110",
     birthdays: "1533936489262747699",
-    generalChat: "1504875096484085984"
+    generalChat: "1504875096484085984",
+    chargeReports: "1533952822775779419"
   },
 
   payout: {

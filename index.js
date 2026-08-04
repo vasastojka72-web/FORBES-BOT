@@ -8,7 +8,7 @@ import cron from "node-cron";
 import { Client, GatewayIntentBits, Partials, EmbedBuilder, AttachmentBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, REST, Routes, SlashCommandBuilder } from "discord.js";
 import { CONFIG } from "./config.js";
 import {readDb, writeDb, writeDbAsync, id, initDb, getDbInfo} from "./storage.js";
-import {ensureMediaSystem, uploadBase64Media, deleteMedia, MEDIA_PATHS, mediaConfigured} from "./media-storage.js";
+import {ensureMediaSystem, uploadBase64Media, deleteMedia, getMediaPublicUrl, MEDIA_PATHS, mediaConfigured} from "./media-storage.js";
 
 
 process.on("unhandledRejection", (err)=>console.error("UNHANDLED REJECTION:", err));
@@ -4197,10 +4197,14 @@ function chargeCleanItems(items){
 }
 function chargeStatusLabel(s){return ({pending:'🟡 Очікує перевірки',approved:'✅ Одобрено',rejected:'❌ Відхилено',fraud:'⚠️ Обман'})[s]||'🟡 Очікує перевірки';}
 async function chargeReportPayload(report){
-  const giverMember=await findDiscordMemberForRecord({nickname:report.giverNick,staticId:report.giverStaticId}).catch(()=>null);
-  const receiverMember=await findDiscordMemberForRecord({nickname:report.receiverNick,staticId:report.receiverStaticId}).catch(()=>null);
-  const giver=giverMember?`<@${giverMember.id}>`:`${report.giverNick} | ID ${report.giverStaticId}`;
-  const receiver=receiverMember?`<@${receiverMember.id}>`:`${report.receiverNick} | ID ${report.receiverStaticId}`;
+  // Для звітів заряду спочатку шукаємо по точному серверному ніку, а вже потім по Static ID.
+  // Це не дає боту тегнути іншу людину, якщо в старих/тестових даних ID випадково дублювався.
+  const giverMember=(await findDiscordMemberForRecord({nickname:report.giverNick}).catch(()=>null))||
+    (await findDiscordMemberForRecord({nickname:report.giverNick,staticId:report.giverStaticId}).catch(()=>null));
+  const receiverMember=(await findDiscordMemberForRecord({nickname:report.receiverNick}).catch(()=>null))||
+    (await findDiscordMemberForRecord({nickname:report.receiverNick,staticId:report.receiverStaticId}).catch(()=>null));
+  const giver=giverMember?`<@${giverMember.id}> — ${report.giverNick} | ID ${report.giverStaticId}`:`${report.giverNick} | ID ${report.giverStaticId}`;
+  const receiver=receiverMember?`<@${receiverMember.id}> — ${report.receiverNick} | ID ${report.receiverStaticId}`:`${report.receiverNick} | ID ${report.receiverStaticId}`;
   const itemText=(report.items||[]).map(x=>`• **${x.name}:** ${x.quantity}`).join('\n')||'—';
   const e=embed('📦 Звіт заряду FORBES',`**Хто видав:** ${giver}\n**Хто отримав:** ${receiver}\n**Хто подав звіт:** <@${report.submittedByDiscordId}>\n\n**Предмети:**\n${itemText}\n\n**Статус:** ${chargeStatusLabel(report.status)}${report.reviewComment?`\n**Коментар:** ${report.reviewComment}`:''}`);
   const components=report.status==='pending'?[row([
@@ -4214,7 +4218,18 @@ async function chargeReportPayload(report){
 app.get('/api/charge/items', protect, async(req,res)=>{
   const member=await requireFamilyRole(req,res); if(!member)return;
   const db=chargeEnsureDb(readDb());
-  res.json({ok:true,items:db.chargeItems.filter(x=>x.active!==false).sort((a,b)=>(a.order||0)-(b.order||0)),canEditItems:chargeIsOwnerReq(req)});
+  const source=db.chargeItems.filter(x=>x.active!==false).sort((a,b)=>(a.order||0)-(b.order||0));
+  const items=source.map(item=>{
+    const out={...item};
+    // Фото предметів заряду працюють так само, як інші фото сайту:
+    // зберігаємо і повертаємо постійне публічне Supabase URL, без тимчасових підписів.
+    if(item.imageBucket&&item.imagePath){
+      out.imageUrl=getMediaPublicUrl(item.imageBucket,item.imagePath)||item.imageUrl||'';
+    }
+    return out;
+  });
+  res.set('Cache-Control','no-store');
+  res.json({ok:true,items,canEditItems:chargeIsOwnerReq(req)});
 });
 app.post('/api/charge/items', protect, ownerOnly, async(req,res)=>{
   try{

@@ -47,5 +47,19 @@ export async function uploadBase64Media(kind,file){
   const {data}=mediaSupabase.storage.from(rule.bucket).getPublicUrl(path);
   return {bucket:rule.bucket,path,publicUrl:data.publicUrl,name:file.name||`${base}.${ext}`,mimeType:mime,size:buf.length,kind};
 }
+
+export function getMediaPublicUrl(bucket,path){
+  if(!mediaSupabase||!bucket||!path) return "";
+  const {data}=mediaSupabase.storage.from(bucket).getPublicUrl(path);
+  return data?.publicUrl||"";
+}
+
+export async function createMediaSignedUrl(bucket,path,expiresIn=3600){
+  if(!mediaSupabase||!bucket||!path) return "";
+  const {data,error}=await mediaSupabase.storage.from(bucket).createSignedUrl(path,expiresIn);
+  if(error) throw error;
+  return data?.signedUrl||"";
+}
+
 export async function deleteMedia(bucket,path){if(!mediaSupabase||!bucket||!path)return; const {error}=await mediaSupabase.storage.from(bucket).remove([path]); if(error) throw error;}
 export const MEDIA_PATHS={car:`${IMAGE_BUCKET}/cars`,estate:`${IMAGE_BUCKET}/estate`,office:`${IMAGE_BUCKET}/office`,gallery:`${IMAGE_BUCKET}/gallery`,family:`${IMAGE_BUCKET}/family`,leadership:`${IMAGE_BUCKET}/leadership`,history:`${IMAGE_BUCKET}/history`,charge:`${IMAGE_BUCKET}/charge-items`,track:`${MUSIC_BUCKET}/tracks`,cover:`${MUSIC_BUCKET}/covers`};

@@ -2089,8 +2089,35 @@ async function interactionMember(interaction){
 }
 
 async function denyNoPerm(interaction, text="❌ У вас немає прав для цієї дії."){
-  if(interaction.replied || interaction.deferred) return;
+  if(interaction.deferred || interaction.replied){
+    return interaction.followUp({content:text, ephemeral:true}).catch(()=>{});
+  }
   return interaction.reply({content:text, ephemeral:true});
+}
+
+async function deferReviewButton(interaction){
+  if(interaction.deferred || interaction.replied) return true;
+  try{
+    await interaction.deferUpdate();
+    return true;
+  }catch(e){
+    console.error("button deferUpdate failed", interaction.customId, e);
+    return false;
+  }
+}
+
+async function reviewButtonError(interaction, text="❌ Помилка обробки кнопки."){
+  if(interaction.deferred || interaction.replied){
+    return interaction.followUp({content:text, ephemeral:true}).catch(()=>{});
+  }
+  return interaction.reply({content:text, ephemeral:true}).catch(()=>{});
+}
+
+async function finishReviewButton(interaction, payload){
+  if(interaction.deferred || interaction.replied){
+    return interaction.editReply(payload);
+  }
+  return interaction.update(payload);
 }
 
 client.on("interactionCreate", async interaction=>{
@@ -2109,6 +2136,8 @@ client.on("interactionCreate", async interaction=>{
     if(!interaction.isButton()) return;
 
     const [action,itemId]=interaction.customId.split(":");
+    const reviewActions = new Set(["app_approve","app_reject","farm_approve","farm_reject","warnpay_approve","warnpay_reject","finepay_approve","finepay_reject"]);
+    if(reviewActions.has(action)) await deferReviewButton(interaction);
     const db=readDb();
     const member = await interactionMember(interaction);
 
@@ -2150,7 +2179,7 @@ client.on("interactionCreate", async interaction=>{
     // ЗАЯВКИ: права залежать від типу заявки
     if(action==="app_approve"||action==="app_reject"){
       const app=db.applications.find(x=>x.id===itemId);
-      if(!app) return interaction.reply({content:"Заявку не знайдено",ephemeral:true});
+      if(!app) return reviewButtonError(interaction,"❌ Заявку не знайдено.");
       const type=String(app.type||"").toLowerCase();
       const isDismiss=type.includes("увал")||type.includes("звіль")||type==="dismissal";
       const allowed=isDismiss
@@ -2161,7 +2190,7 @@ client.on("interactionCreate", async interaction=>{
           ? "❌ Увал можуть одобряти тільки Лідер, Зам.лідера або Права рука."
           : "❌ Заявку можуть одобряти Лідер, Зам, Права рука, Старший каптер або Фарм менеджер.");
       }
-      if(app.status!=="pending") return interaction.reply({content:`Заявка вже оброблена: ${app.status}`,ephemeral:true});
+      if(app.status!=="pending") return reviewButtonError(interaction,`ℹ️ Заявка вже оброблена: ${app.status}`);
       app.status = action==="app_approve" ? "approved" : "rejected";
       app.reviewedBy=interaction.user.id; app.reviewedAt=now();
       let resultText="";
@@ -2170,7 +2199,7 @@ client.on("interactionCreate", async interaction=>{
         try{const result=await applyApplicationApprove(app);resultText=result.ok?`\n✅ Роль видана, нік встановлено: **${result.nickname}**`:`\n⚠️ Роль/нік не видано: ${result.reason}`;}catch(e){resultText="\n⚠️ Бот не зміг видати роль або змінити нік.";}
       }
       await writeDbAsync(db);
-      return interaction.update({content:`Заявку ${app.status==="approved"?"✅ одобрено":"❌ відхилено"} модератором ${interaction.user}.${resultText}`,components:[],embeds:interaction.message.embeds});
+      return finishReviewButton(interaction,{content:`Заявку ${app.status==="approved"?"✅ одобрено":"❌ відхилено"} модератором ${interaction.user}.${resultText}`,components:[],embeds:interaction.message.embeds});
     }
 
     // ФАРМ-ЗВІТИ: тільки Лідер / Зам / Права рука / Фарм менеджер
@@ -2180,16 +2209,16 @@ client.on("interactionCreate", async interaction=>{
       }
 
       const r=db.farmReports.find(x=>x.id===itemId);
-      if(!r) return interaction.reply({content:"Не знайдено звіт",ephemeral:true});
+      if(!r) return reviewButtonError(interaction,"❌ Не знайдено звіт.");
       r.status=action==="farm_approve"?"approved":"rejected";
       r.reviewedBy=interaction.user.id;
       r.reviewedAt=now();
       r.discordStatus="sent";
       r.amount=Number(r.amount || r.contractAmount || 0);
       r.contractAmount=Number(r.contractAmount || r.amount || 0);
-      writeDb(db);
+      await writeDbAsync(db);
       if(typeof addLog === "function") addLog("Farm-звіт перевірено", {id:r.id,status:r.status,by:interaction.user.id});
-      return interaction.update({
+      return finishReviewButton(interaction,{
         content:`Фарм-звіт ${r.status==="approved"?"✅ одобрено":"❌ відхилено"} модератором ${interaction.user}`,
         components:[],
         embeds:interaction.message.embeds
@@ -2224,7 +2253,8 @@ client.on("interactionCreate", async interaction=>{
       }
 
       const p=db.warnings.find(x=>x.id===itemId);
-      if(!p) return interaction.reply({content:"Не знайдено запит на зняття догани",ephemeral:true});
+      if(!p) return reviewButtonError(interaction,"❌ Не знайдено запит на зняття догани.");
+      if(["approved","rejected"].includes(String(p.status))) return reviewButtonError(interaction,"ℹ️ Цей запит уже оброблено.");
 
       p.status=action==="warnpay_approve"?"approved":"rejected";
       p.reviewedBy=interaction.user.id;
@@ -2236,9 +2266,9 @@ client.on("interactionCreate", async interaction=>{
         original.closedAt = now();
       }
 
-      writeDb(db);
+      await writeDbAsync(db);
 
-      return interaction.update({
+      return finishReviewButton(interaction,{
         content:`Запит на зняття догани ${p.status==="approved"?"✅ одобрено":"❌ відхилено"} модератором ${interaction.user}`,
         components:[],
         embeds:interaction.message.embeds
@@ -2252,7 +2282,8 @@ client.on("interactionCreate", async interaction=>{
       }
 
       const p=db.fines.find(x=>x.id===itemId);
-      if(!p) return interaction.reply({content:"Не знайдено оплату",ephemeral:true});
+      if(!p) return reviewButtonError(interaction,"❌ Не знайдено оплату штрафу.");
+      if(["paid","rejected"].includes(String(p.status))) return reviewButtonError(interaction,"ℹ️ Цю оплату вже оброблено.");
 
       p.status=action==="finepay_approve"?"paid":"rejected";
       p.reviewedBy=interaction.user.id;
@@ -2264,7 +2295,7 @@ client.on("interactionCreate", async interaction=>{
         if(action==="finepay_approve") original.paidAt = now();
       }
 
-      writeDb(db);
+      await writeDbAsync(db);
 
       const fineCh = await channel(CONFIG.channels.fines);
       if(fineCh && original && action==="finepay_approve"){
@@ -2275,7 +2306,7 @@ client.on("interactionCreate", async interaction=>{
         )]}).catch(()=>{});
       }
 
-      return interaction.update({
+      return finishReviewButton(interaction,{
         content:`Оплату штрафу ${p.status==="paid"?"✅ одобрено":"❌ відхилено"} модератором ${interaction.user}`,
         components:[],
         embeds:interaction.message.embeds
@@ -2283,8 +2314,8 @@ client.on("interactionCreate", async interaction=>{
     }
 
   }catch(err){
-    console.error(err);
-    if(!interaction.replied&&!interaction.deferred) interaction.reply({content:"❌ Помилка бота",ephemeral:true}).catch(()=>{});
+    console.error("interaction button failed", interaction.customId, err);
+    await reviewButtonError(interaction,"❌ Помилка бота під час обробки кнопки. Спробуйте ще раз.");
   }
 });
 
@@ -4188,7 +4219,13 @@ function chargeEnsureDb(db){
   db.chargeReports=Array.isArray(db.chargeReports)?db.chargeReports:[];
   return db;
 }
-function chargeIsStaff(member,req){ return forbes2026Capt(member,req)||forbes2026Full(member,req); }
+function chargeIsStaff(member,req){
+  // Модерація звітів заряду: власник, лідер, лідер 2, зам лідера, старший каптер.
+  // Звичайні учасники можуть бачити предмети й подавати звіти, але не модерувати.
+  return chargeIsOwnerReq(req)||forbes2026Main(req)||
+    forbes2026HasId(member,[CONFIG.roles.leader,FORBES_ACCESS_ROLE_IDS_2026.leader2,FORBES_ACCESS_ROLE_IDS_2026.deputy,FORBES_ACCESS_ROLE_IDS_2026.seniorCapt,CONFIG.roles.seniorCapt])||
+    forbes2026HasName(member,['лідер','лідер 2','зам лідера','старший каптер']);
+}
 function chargeIsOwnerReq(req){ return String(req.user?.id||'')===String(CONFIG.ownerId); }
 function chargeCleanItems(items){
   return (Array.isArray(items)?items:[]).map(x=>({
@@ -4240,12 +4277,16 @@ app.get('/api/charge/items', protect, async(req,res)=>{
   const member=await apiMemberOr403(req,res); if(!member)return;
   const db=chargeEnsureDb(readDb());
   const source=db.chargeItems.filter(x=>x.active!==false).sort((a,b)=>(a.order||0)-(b.order||0));
+  const forwardedProto=String(req.headers['x-forwarded-proto']||'').split(',')[0].trim();
+  const proto=forwardedProto||req.protocol||'https';
+  const apiOrigin=`${proto}://${req.get('host')}`;
   const items=source.map(item=>{
     const out={...item};
-    // Фото предметів заряду працюють так само, як інші фото сайту:
-    // зберігаємо і повертаємо постійне публічне Supabase URL, без тимчасових підписів.
+    // Постійний URL через наш API тільки для фото предметів заряду.
+    // Він однаковий для всіх користувачів і не залежить від приватності bucket, кешу чи Supabase-сесії.
     if(item.imageBucket&&item.imagePath){
-      out.imageUrl=getMediaPublicUrl(item.imageBucket,item.imagePath)||item.imageUrl||'';
+      const stamp=encodeURIComponent(String(item.updatedAt||item.createdAt||item.id||''));
+      out.imageUrl=`${apiOrigin}/api/charge/items/${encodeURIComponent(item.id)}/image?v=${stamp}`;
     }
     return out;
   });
@@ -4307,8 +4348,25 @@ app.delete('/api/charge/reports/:id', protect, async(req,res)=>{
   }catch(e){res.status(500).json({ok:false,error:'charge_report_delete_failed',message:e.message});}
 });
 client.on('interactionCreate',async interaction=>{
-  try{if(!interaction.isButton()||!String(interaction.customId).startsWith('charge_'))return;const [action,reportId]=interaction.customId.split(':');const member=await interactionMember(interaction);if(!chargeIsStaff(member,null))return denyNoPerm(interaction,'❌ Цю дію можуть виконувати тільки старші каптьори, зами та лідер.');const map={charge_approve:'approved',charge_reject:'rejected',charge_fraud:'fraud'};const status=map[action];if(!status)return;const db=chargeEnsureDb(readDb());const r=db.chargeReports.find(x=>String(x.id)===String(reportId));if(!r)return interaction.reply({content:'❌ Звіт не знайдено.',ephemeral:true});r.status=status;r.reviewedByDiscordId=interaction.user.id;r.reviewedByName=member.displayName||interaction.user.username;r.reviewedAt=now();await writeDbAsync(db);await interaction.update(await chargeReportPayload(r));}
-  catch(e){console.error('charge button failed',e);if(!interaction.replied&&!interaction.deferred)interaction.reply({content:'❌ Помилка обробки.',ephemeral:true}).catch(()=>{});}
+  if(!interaction.isButton()||!String(interaction.customId).startsWith('charge_'))return;
+  try{
+    await deferReviewButton(interaction);
+    const [action,reportId]=interaction.customId.split(':');
+    const member=await interactionMember(interaction);
+    if(!(String(interaction.user.id)===String(CONFIG.ownerId)||chargeIsStaff(member,null)))return denyNoPerm(interaction,'❌ Цю дію можуть виконувати тільки старший каптер, зам лідера, лідер 2, лідер або власник.');
+    const map={charge_approve:'approved',charge_reject:'rejected',charge_fraud:'fraud'};
+    const status=map[action];if(!status)return;
+    const db=chargeEnsureDb(readDb());
+    const r=db.chargeReports.find(x=>String(x.id)===String(reportId));
+    if(!r)return reviewButtonError(interaction,'❌ Звіт не знайдено.');
+    if(r.status && r.status!=='pending')return reviewButtonError(interaction,`ℹ️ Звіт уже оброблено: ${chargeStatusLabel(r.status)}`);
+    r.status=status;r.reviewedByDiscordId=interaction.user.id;r.reviewedByName=member.displayName||interaction.user.username;r.reviewedAt=now();
+    await writeDbAsync(db);
+    await finishReviewButton(interaction,await chargeReportPayload(r));
+  }catch(e){
+    console.error('charge button failed',interaction.customId,e);
+    await reviewButtonError(interaction,'❌ Помилка обробки кнопки звіту. Спробуйте ще раз.');
+  }
 });
 
 app.listen(PORT, ()=>{

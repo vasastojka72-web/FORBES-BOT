@@ -61,7 +61,14 @@ function protect(req, res, next){
   const verified=verifyAuthToken(bearer);
   if(verified){req.user={...req.user,...verified};return next();}
   if(API_SECRET && req.headers["x-api-secret"]===API_SECRET)return next();
-  return res.status(401).json({ok:false,error:"auth_required",message:"Потрібен повторний вхід через Discord."});
+
+  // Гостьовий режим: читати інформацію можна без Discord-входу.
+  // Будь-які POST/PATCH/PUT/DELETE як і раніше вимагають авторизацію.
+  if(String(req.method||"GET").toUpperCase()==="GET"){
+    req.user={id:"",name:"Гість",roles:[],guest:true};
+    return next();
+  }
+  return res.status(401).json({ok:false,error:"auth_required",message:"Увійдіть через Discord, щоб виконати цю дію."});
 }
 function ownerOnly(req, res, next){
   const userId=String(req.user?.id||"");
@@ -297,7 +304,8 @@ app.get("/auth/discord/callback", async (req, res) => {
       roles = [];
     }
 
-    const userPayload={id:user.id,name:serverNick,username:user.username,globalName:user.global_name,avatar:user.avatar,roles};
+    const highestRole = roles[0] || null;
+    const userPayload={id:user.id,name:serverNick,username:user.username,globalName:user.global_name,avatar:user.avatar,roles,highestRole,highestRoleName:highestRole?.name||"Учасник"};
     const payload=Buffer.from(JSON.stringify(userPayload)).toString("base64url");
     const discordToken=signAuthPayload({...userPayload,iat:Date.now()});
     return res.redirect(`${NETLIFY_SITE_URL}?discord_user=${payload}&discord_token=${encodeURIComponent(discordToken)}`);
@@ -386,7 +394,7 @@ function cleanForbesRolesFinal(member){
     return Array.from(member.roles.cache.values())
       .filter(r=>r && r.name && r.name !== "@everyone")
       .sort((a,b)=>(b.position||0)-(a.position||0))
-      .map(r=>({id:r.id,name:r.name}));
+      .map(r=>({id:r.id,name:r.name,position:Number(r.position||0)}));
   }catch(e){ return []; }
 }
 
@@ -411,6 +419,8 @@ async function getPublicMembersFromDiscord(){
           playerId: parsed.staticId,
           id: parsed.staticId,
           role: roles[0]?.name || "Учасник",
+          highestRole: roles[0] || null,
+          highestRoleName: roles[0]?.name || "Учасник",
           roles,
           status: m.presence?.status || "offline",
           presence: m.presence?.status || "offline",
@@ -2735,8 +2745,8 @@ async function getGuildMembersSimple(){
     const parsed = parseForbesPlayerNameId(display);
     const roles = member.roles.cache
       .filter(r => r.id !== CONFIG.guildId && r.name !== "@everyone")
-      .map(r => ({id:r.id,name:r.name}))
-      .sort((a,b)=>String(a.name).localeCompare(String(b.name)));
+      .map(r => ({id:r.id,name:r.name,position:Number(r.position||0)}))
+      .sort((a,b)=>(b.position||0)-(a.position||0));
     members.push({
       nickname: parsed.nick,
       nick: parsed.nick,
@@ -2744,6 +2754,9 @@ async function getGuildMembersSimple(){
       staticId: parsed.staticId,
       playerId: parsed.staticId,
       avatar: member.user.displayAvatarURL?.() || "",
+      role: roles[0]?.name || "Учасник",
+      highestRole: roles[0] || null,
+      highestRoleName: roles[0]?.name || "Учасник",
       roles
     });
   });

@@ -312,8 +312,11 @@ app.get("/api/launcher/statistics", protect, (req,res)=>{
     if(players.length) return sum + Number(report.each || 0);
     return sum + Number(report.each || Math.floor(Number(report.amount || report.contractAmount || 0) * 0.8));
   }, 0);
+  // A Discord signup (yes/maybe) is not proof that the member actually played.
+  // Only explicit attendance from a closed capt is personal played-capt statistics.
   const capts = (Array.isArray(db.capts) ? db.capts : []).filter(capt =>
-    [capt.yes, capt.no, capt.maybe, capt.players, capt.participants]
+    String(capt.status || "").toLowerCase() === "closed" &&
+    [capt.attended, capt.players, capt.participants]
       .some(list => Array.isArray(list) && list.some(value => String(value?.userId || value?.discordUserId || value) === discordUserId)));
   const fines = (Array.isArray(db.fines) ? db.fines : []).filter(item => String(item.discordUserId || "") === discordUserId);
   const warnings = (Array.isArray(db.warnings) ? db.warnings : []).filter(item => String(item.discordUserId || "") === discordUserId);
@@ -324,6 +327,7 @@ app.get("/api/launcher/statistics", protect, (req,res)=>{
       playedCapts:capts.length,
       salary,
       finesTotal:fines.length,
+      finesAmount:fines.reduce((sum,item)=>sum+Number(item.amount||item.sum||item.price||0),0),
       finesUnpaid:fines.filter(item=>!["paid","closed"].includes(String(item.status))).length,
       warningsTotal:warnings.length,
       warningsActive:warnings.filter(item=>!["removed","closed"].includes(String(item.status))).length
@@ -514,8 +518,13 @@ async function getPublicMembersFromDiscord(){
     if(!guild) return [];
     const fetched = await guild.members.fetch().catch(()=>null);
     const collection = fetched || guild.members.cache;
+    const familyRoleIds = new Set(Object.entries(CONFIG.roles || {})
+      .filter(([name,value])=>name !== "bot" && value)
+      .map(([,value])=>String(value)));
     return Array.from(collection.values())
       .filter(m=>!m.user?.bot)
+      .filter(m=>String(m.id)===String(CONFIG.ownerId||"") ||
+        Array.from(m.roles?.cache?.keys?.() || []).some(roleId=>familyRoleIds.has(String(roleId))))
       .map(m=>{
         const display = m.displayName || m.nickname || m.user?.username || "Unknown";
         const parsed = parseForbesStaticNickFinal(display);
@@ -524,6 +533,7 @@ async function getPublicMembersFromDiscord(){
           nick: parsed.nick,
           nickname: parsed.nick,
           username: m.user?.username || parsed.nick,
+          discordId: m.id,
           staticId: parsed.staticId,
           playerId: parsed.staticId,
           id: parsed.staticId,
@@ -1383,6 +1393,14 @@ app.post("/api/capts/:id/close", protect, async (req,res)=>{
     capt.resultText = resultText;
     capt.closedAt = now();
     capt.closedBy = member.id;
+    // Attendance starts being recorded only when a capt is closed. Legacy
+    // signups remain historical and no longer inflate personal statistics.
+    capt.attended = Array.from(new Set(
+      (Array.isArray(req.body.attended) ? req.body.attended : (capt.yes || []))
+        .map(value=>String(value?.userId || value?.discordUserId || value))
+        .filter(Boolean)
+        .filter(userId=>!(capt.absent || []).map(String).includes(userId))
+    ));
 
     writeDb(db);
 
@@ -1884,14 +1902,9 @@ function buildForbesStats(db){
     giveaways: giveaways.length
   };
 
-  // Не даємо старим ручним captsTotal/captWins/captLosses перебити реальну статистику, якщо капти ще не грались.
-  const manual = {...(db.familyStatsManual || {})};
-  delete manual.captsTotal;
-  delete manual.captWins;
-  delete manual.captLosses;
-  delete manual.winRate;
-
-  return {...base, ...manual};
+  // Manual values define the current season and intentionally override legacy
+  // records (for example, 5 current capts instead of 11 old database entries).
+  return {...base, ...(db.familyStatsManual || {})};
 }
 
 function buildMemberProfileFromDb(db, member){
@@ -1922,7 +1935,8 @@ function buildMemberProfileFromDb(db, member){
   }
 
   const memberCapts = capts.filter(c => {
-    const all = [...(c.yes||[]), ...(c.no||[]), ...(c.maybe||[]), ...(c.absent||[])].map(String);
+    if(String(c.status||"").toLowerCase() !== "closed") return false;
+    const all = [...(c.attended||[]), ...(c.players||[]), ...(c.participants||[])].map(x=>String(x?.userId||x?.discordUserId||x));
     return all.some(x => x.includes(member.discordId || member.id || "") || x.toLowerCase().includes(nick.toLowerCase()));
   });
   const wins = memberCapts.filter(c=>String(c.result||"").toLowerCase()==="win").length;
@@ -4171,26 +4185,8 @@ app.get("/api/members-autofill", async (req,res)=>{
       console.warn("members-autofill discord source failed", e?.message || e);
     }
 
-    // 2) DB sources where static IDs often exist
-    const db = readDb();
-    const sources = [
-      ["applications", db.applications],
-      ["farmReports", db.farmReports],
-      ["farmReportsArchive", db.farmReportsArchive],
-      ["fines", db.fines],
-      ["warnings", db.warnings],
-      ["blacklist", db.blacklist],
-      ["members", db.members],
-      ["memberProfiles", db.memberProfiles]
-    ];
-    for(const [name, arr] of sources){
-      if(Array.isArray(arr)){
-        for(const item of arr) _autoCollectPlayersFromAny(map, item, name);
-      }else if(arr && typeof arr === "object"){
-        for(const item of Object.values(arr)) _autoCollectPlayersFromAny(map, item, name);
-      }
-    }
-
+    // Historical DB records are intentionally not merged here. Autocomplete is
+    // an active roster and must not resurrect members removed from Discord.
     const members = Array.from(new Set(Array.from(map.values())))
       .filter(x=>x.nick && x.nick !== "-")
       .sort((a,b)=>String(a.nick).localeCompare(String(b.nick),"uk"));

@@ -347,18 +347,21 @@ app.post("/api/launcher/notifications/:id/read", protect, async(req,res)=>{
 // Discord OAuth login
 app.get("/auth/discord", (req, res) => {
   if (!DISCORD_CLIENT_ID) return res.status(500).send("DISCORD_CLIENT_ID is missing");
+  const launcherClient = String(req.query.client || "").toLowerCase() === "launcher";
   const params = new URLSearchParams({
     client_id: DISCORD_CLIENT_ID,
     redirect_uri: DISCORD_REDIRECT_URI,
     response_type: "code",
     scope: "identify guilds.members.read"
   });
+  if (launcherClient) params.set("state", "forbes_launcher");
   res.redirect(`https://discord.com/oauth2/authorize?${params.toString()}`);
 });
 
 app.get("/auth/discord/callback", async (req, res) => {
   try {
     const code = req.query.code;
+    const launcherClient = String(req.query.state || "") === "forbes_launcher";
     if (!code) return res.redirect(`${NETLIFY_SITE_URL}?login=no_code`);
 
     const params = new URLSearchParams();
@@ -409,6 +412,11 @@ app.get("/auth/discord/callback", async (req, res) => {
     const userPayload={id:user.id,name:serverNick,username:user.username,globalName:user.global_name,avatar:user.avatar,roles,highestRole,highestRoleName:highestRole?.name||"Учасник"};
     const payload=Buffer.from(JSON.stringify(userPayload)).toString("base64url");
     const discordToken=signAuthPayload({...userPayload,iat:Date.now()});
+    if (launcherClient) {
+      const safeToken = JSON.stringify(discordToken);
+      const safePayload = JSON.stringify(payload);
+      return res.type("html").send(`<!doctype html><html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>FORBES Launcher</title><style>html,body{height:100%;margin:0;background:#0b0c10;color:#fff;font-family:Segoe UI,sans-serif}body{display:grid;place-items:center}.card{text-align:center;padding:36px;border:1px solid #30323a;border-radius:18px;background:#16171c}.ok{font-size:44px;color:#47d17a}h1{font-size:22px}p{color:#9a9da7}</style></head><body><div class="card"><div class="ok">✓</div><h1>Discord підключено</h1><p>Повертаємося до FORBES Launcher…</p></div><script>const p=${safePayload};const b=p.replace(/-/g,'+').replace(/_/g,'/');const json=decodeURIComponent(Array.from(atob(b),c=>'%'+c.charCodeAt(0).toString(16).padStart(2,'0')).join(''));localStorage.setItem('forbesLauncherToken',${safeToken});localStorage.setItem('forbesLauncherUser',json);document.documentElement.dataset.forbesLauncherAuth='complete';</script></body></html>`);
+    }
     return res.redirect(`${NETLIFY_SITE_URL}?discord_user=${payload}&discord_token=${encodeURIComponent(discordToken)}`);
   } catch (err) {
     console.error("OAuth callback error", err);

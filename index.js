@@ -56,6 +56,26 @@ function nextSimpleId(db, prefix, collections = []){
   return `${prefix}_${next}`;
 }
 
+function addUserNotification(db, notification = {}){
+  const discordUserId = String(notification.discordUserId || "").trim();
+  if(!discordUserId) return null;
+  db.notifications = Array.isArray(db.notifications) ? db.notifications : [];
+  const item = {
+    id: id("notification"),
+    discordUserId,
+    type: String(notification.type || "system"),
+    title: String(notification.title || "FORBES Launcher"),
+    message: String(notification.message || ""),
+    entityType: String(notification.entityType || ""),
+    entityId: String(notification.entityId || ""),
+    createdAt: new Date().toISOString(),
+    readAt: null
+  };
+  db.notifications.unshift(item);
+  db.notifications = db.notifications.slice(0, 2000);
+  return item;
+}
+
 function protect(req, res, next){
   const bearer=String(req.headers.authorization||"").replace(/^Bearer\s+/i,"");
   const verified=verifyAuthToken(bearer);
@@ -242,6 +262,36 @@ function _autoCollectPlayersFromAny(map, obj, source){
 
 app.get("/", (req,res)=>res.json({ok:true,name:"FORBES BOT API",time:now()}));
 app.get("/health", (req,res)=>res.json({ok:true,botReady:client.isReady(),time:now()}));
+
+app.get("/api/launcher/notifications", protect, (req,res)=>{
+  const discordUserId = String(req.user?.id || "");
+  if(!discordUserId || req.user?.guest){
+    return res.status(401).json({ok:false,error:"auth_required",message:"Discord authorization is required."});
+  }
+  const limit = Math.min(Math.max(Number(req.query.limit || 50), 1), 100);
+  const since = String(req.query.since || "");
+  const db = readDb();
+  let notifications = (Array.isArray(db.notifications) ? db.notifications : [])
+    .filter(item => String(item.discordUserId) === discordUserId);
+  if(since){
+    const sinceTime = Date.parse(since);
+    if(Number.isFinite(sinceTime)) notifications = notifications.filter(item => Date.parse(item.createdAt) > sinceTime);
+  }
+  notifications = notifications.slice(0, limit);
+  res.json({ok:true,notifications,unread:notifications.filter(item=>!item.readAt).length,serverTime:new Date().toISOString()});
+});
+
+app.post("/api/launcher/notifications/:id/read", protect, async(req,res)=>{
+  const discordUserId = String(req.user?.id || "");
+  if(!discordUserId || req.user?.guest) return res.status(401).json({ok:false,error:"auth_required"});
+  const db = readDb();
+  const item = (Array.isArray(db.notifications) ? db.notifications : [])
+    .find(entry => String(entry.id) === String(req.params.id) && String(entry.discordUserId) === discordUserId);
+  if(!item) return res.status(404).json({ok:false,error:"notification_not_found"});
+  item.readAt = item.readAt || new Date().toISOString();
+  await writeDbAsync(db);
+  res.json({ok:true,notification:item});
+});
 
 // Discord OAuth login
 app.get("/auth/discord", (req, res) => {
@@ -719,7 +769,7 @@ app.post("/api/applications", protect, async (req,res)=>{
       nickname:req.body.nickname||req.body.nick||"",
       staticId:req.body.staticId||req.body.playerId||"",
       discord:req.body.discord||"",
-      discordUserId:req.body.discordUserId||"",
+      discordUserId:req.user?.id||req.body.discordUserId||"",
       discordName:req.body.discordName||"",
       age:req.body.age||"",
       level:req.body.level||"",
@@ -1053,6 +1103,14 @@ app.post("/api/farm-reports/:id/status", protect, async (req,res)=>{
     report.amount = Number(report.amount || report.contractAmount || 0);
     report.contractAmount = Number(report.contractAmount || report.amount || 0);
     report.each = Number(report.each || ((report.players||[]).length ? Math.floor(report.amount*0.8/(report.players||[]).length) : 0));
+    addUserNotification(db, {
+      discordUserId: report.discordUserId,
+      type: "farm_report_status",
+      title: status === "approved" ? "Звіт схвалено" : status === "rejected" ? "Звіт відхилено" : "Статус звіту змінено",
+      message: `Фарм-звіт ${report.id}: ${status}`,
+      entityType: "farm_report",
+      entityId: report.id
+    });
     writeDb(db);
 
     debugLog("farm_status_manual_change", {id:report.id, oldStatus, newStatus:status, by:member.id});
@@ -1374,6 +1432,14 @@ app.post("/api/fines", protect, async (req,res)=>{
       createdByDiscordId:member.id
     };
     db.fines.unshift(item);
+    addUserNotification(db, {
+      discordUserId: item.discordUserId,
+      type: "fine_created",
+      title: "Новий штраф",
+      message: `${item.reason || "Без причини"}. Сума: ${money(item.amount)}.`,
+      entityType: "fine",
+      entityId: item.id
+    });
     writeDb(db);
 
     const playerLabel = await discordPlayerLabel(item);
@@ -1464,7 +1530,16 @@ app.post("/api/warnings", protect, async (req,res)=>{
     const expires=new Date(Date.now()+CONFIG.warnings.days*86400000);
     const targetMember=await findDiscordMemberForRecord(req.body||{});
     const item={id:nextSimpleId(db,"warn",["warnings"]),nickname:req.body.nickname||req.body.nick||"",staticId:req.body.staticId||req.body.playerId||"",discordUserId:targetMember?.id||req.body.discordUserId||"",reason:req.body.reason||"",screenshotUrl:safeRemoteMediaUrl(req.body.screenshotUrl),status:"active",expiresAt:expires.toISOString(),createdAt:now(),createdBy:member.displayName||member.user?.username||"",createdByDiscordId:member.id};
-    db.warnings.unshift(item); writeDb(db);
+    db.warnings.unshift(item);
+    addUserNotification(db, {
+      discordUserId: item.discordUserId,
+      type: "warning_created",
+      title: "Нова догана",
+      message: item.reason || "Причину не вказано.",
+      entityType: "warning",
+      entityId: item.id
+    });
+    writeDb(db);
     const count=db.warnings.filter(w=>w.staticId===item.staticId&&w.status==="active").length;
     const ch=await channel(CONFIG.channels.warnings);
     if(ch){
@@ -2208,6 +2283,14 @@ client.on("interactionCreate", async interaction=>{
       if(action==="app_approve" && roleApplication){
         try{const result=await applyApplicationApprove(app);resultText=result.ok?`\n✅ Роль видана, нік встановлено: **${result.nickname}**`:`\n⚠️ Роль/нік не видано: ${result.reason}`;}catch(e){resultText="\n⚠️ Бот не зміг видати роль або змінити нік.";}
       }
+      addUserNotification(db, {
+        discordUserId: app.discordUserId || app.userId,
+        type: "application_status",
+        title: app.status === "approved" ? "Заявку схвалено" : "Заявку відхилено",
+        message: `Заявка ${app.id} ${app.status === "approved" ? "схвалена" : "відхилена"}.`,
+        entityType: "application",
+        entityId: app.id
+      });
       await writeDbAsync(db);
       return finishReviewButton(interaction,{content:`Заявку ${app.status==="approved"?"✅ одобрено":"❌ відхилено"} модератором ${interaction.user}.${resultText}`,components:[],embeds:interaction.message.embeds});
     }
@@ -2226,6 +2309,14 @@ client.on("interactionCreate", async interaction=>{
       r.discordStatus="sent";
       r.amount=Number(r.amount || r.contractAmount || 0);
       r.contractAmount=Number(r.contractAmount || r.amount || 0);
+      addUserNotification(db, {
+        discordUserId: r.discordUserId,
+        type: "farm_report_status",
+        title: r.status === "approved" ? "Звіт схвалено" : "Звіт відхилено",
+        message: `Фарм-звіт ${r.id} ${r.status === "approved" ? "схвалено" : "відхилено"} модератором.`,
+        entityType: "farm_report",
+        entityId: r.id
+      });
       await writeDbAsync(db);
       if(typeof addLog === "function") addLog("Farm-звіт перевірено", {id:r.id,status:r.status,by:interaction.user.id});
       return finishReviewButton(interaction,{

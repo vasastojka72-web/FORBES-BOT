@@ -273,12 +273,63 @@ app.get("/api/launcher/notifications", protect, (req,res)=>{
   const db = readDb();
   let notifications = (Array.isArray(db.notifications) ? db.notifications : [])
     .filter(item => String(item.discordUserId) === discordUserId);
+  const announcements = (Array.isArray(db.announcements) ? db.announcements : []).map(item => ({
+    id: `announcement:${item.id}`,
+    discordUserId,
+    type: "announcement",
+    title: item.title || "Оголошення FORBES",
+    message: item.text || item.message || "",
+    entityType: "announcement",
+    entityId: String(item.id || ""),
+    createdAt: item.createdAt || new Date(0).toISOString(),
+    readAt: null
+  }));
+  notifications = [...notifications, ...announcements]
+    .sort((a,b)=>Date.parse(b.createdAt)-Date.parse(a.createdAt));
   if(since){
     const sinceTime = Date.parse(since);
     if(Number.isFinite(sinceTime)) notifications = notifications.filter(item => Date.parse(item.createdAt) > sinceTime);
   }
   notifications = notifications.slice(0, limit);
   res.json({ok:true,notifications,unread:notifications.filter(item=>!item.readAt).length,serverTime:new Date().toISOString()});
+});
+
+app.get("/api/launcher/statistics", protect, (req,res)=>{
+  const discordUserId = String(req.user?.id || "");
+  if(!discordUserId || req.user?.guest){
+    return res.status(401).json({ok:false,error:"auth_required",message:"Discord authorization is required."});
+  }
+  const db = readDb();
+  const belongsToUser = item => {
+    if(String(item?.discordUserId || item?.userId || "") === discordUserId) return true;
+    return (Array.isArray(item?.players) ? item.players : []).some(player =>
+      String(player?.discordUserId || player?.userId || "") === discordUserId);
+  };
+  const approvedReports = (Array.isArray(db.farmReports) ? db.farmReports : [])
+    .filter(report => report.status === "approved" && belongsToUser(report));
+  const salary = approvedReports.reduce((sum, report) => {
+    const players = Array.isArray(report.players) ? report.players : [];
+    if(players.length) return sum + Number(report.each || 0);
+    return sum + Number(report.each || Math.floor(Number(report.amount || report.contractAmount || 0) * 0.8));
+  }, 0);
+  const capts = (Array.isArray(db.capts) ? db.capts : []).filter(capt =>
+    [capt.yes, capt.no, capt.maybe, capt.players, capt.participants]
+      .some(list => Array.isArray(list) && list.some(value => String(value?.userId || value?.discordUserId || value) === discordUserId)));
+  const fines = (Array.isArray(db.fines) ? db.fines : []).filter(item => String(item.discordUserId || "") === discordUserId);
+  const warnings = (Array.isArray(db.warnings) ? db.warnings : []).filter(item => String(item.discordUserId || "") === discordUserId);
+  res.json({
+    ok:true,
+    statistics:{
+      completedContracts:approvedReports.length,
+      playedCapts:capts.length,
+      salary,
+      finesTotal:fines.length,
+      finesUnpaid:fines.filter(item=>!["paid","closed"].includes(String(item.status))).length,
+      warningsTotal:warnings.length,
+      warningsActive:warnings.filter(item=>!["removed","closed"].includes(String(item.status))).length
+    },
+    serverTime:new Date().toISOString()
+  });
 });
 
 app.post("/api/launcher/notifications/:id/read", protect, async(req,res)=>{

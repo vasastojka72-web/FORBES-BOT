@@ -114,6 +114,62 @@ function protect(req, res, next){
   return res.status(401).json({ok:false,error:"auth_required",message:"Увійдіть через Discord, щоб виконати цю дію."});
 }
 
+// Ephemeral live presence. Presence is deliberately not written to the main DB:
+// after a backend restart every client must prove it is online with a heartbeat.
+const livePresence = new Map();
+let discordMemberCountCache = { value: 0, updatedAt: 0 };
+const PRESENCE_TTL_MS = 120 * 1000;
+const DISCORD_COUNT_CACHE_MS = 5 * 60 * 1000;
+
+function normalizedPresenceStatus(value){
+  const status=String(value||"").toLowerCase();
+  return ["launcher","playing","afk"].includes(status)?status:"launcher";
+}
+async function cachedDiscordMemberCount(){
+  const nowMs=Date.now();
+  if(discordMemberCountCache.updatedAt && nowMs-discordMemberCountCache.updatedAt<DISCORD_COUNT_CACHE_MS)
+    return discordMemberCountCache.value;
+  try{
+    const guild=client.guilds.cache.get(String(CONFIG.guildId)) || await client.guilds.fetch(CONFIG.guildId);
+    const value=Number(guild?.memberCount||0);
+    if(value>0) discordMemberCountCache={value,updatedAt:nowMs};
+  }catch(error){
+    console.warn("presence discord count cache:",error?.message||error);
+  }
+  return discordMemberCountCache.value;
+}
+async function livePresenceSnapshot(){
+  const nowMs=Date.now();
+  for(const [userId,item] of livePresence){
+    if(nowMs-Number(item.lastSeen||0)>=PRESENCE_TTL_MS) livePresence.delete(userId);
+  }
+  const active=[...livePresence.values()];
+  return {
+    playing:active.filter(x=>x.status==="playing").length,
+    launcher:active.filter(x=>x.status!=="offline").length,
+    afk:active.filter(x=>x.status==="afk").length,
+    discord:await cachedDiscordMemberCount(),
+    updatedAt:new Date(nowMs).toISOString(),
+    updatedAtUnixMs:nowMs
+  };
+}
+
+app.post("/api/presence/heartbeat", protect, async(req,res)=>{
+  const userId=String(req.user?.id||"");
+  if(!userId||req.user?.guest)return res.status(401).json({ok:false,error:"auth_required"});
+  const status=normalizedPresenceStatus(req.body?.status);
+  livePresence.set(userId,{
+    status,
+    lastSeen:Date.now(),
+    launcherVersion:String(req.body?.launcherVersion||"").slice(0,32)
+  });
+  res.json({ok:true,status,snapshot:await livePresenceSnapshot()});
+});
+
+app.get("/api/presence/live", async(req,res)=>{
+  res.json({ok:true,snapshot:await livePresenceSnapshot()});
+});
+
 app.post("/api/launcher/afk/toggle", protect, async (req,res)=>{
   const userId=String(req.user?.id||"");
   const afkChannelId=String(process.env.DISCORD_AFK_CHANNEL_ID||"");
@@ -143,6 +199,7 @@ app.post("/api/launcher/afk/toggle", protect, async (req,res)=>{
       await member.voice.setChannel(previous, "FORBES Launcher: AFK OFF");
       delete db.afkSessions[userId];
       await writeDbAsync(db);
+      livePresence.set(userId,{...(livePresence.get(userId)||{}),status:"launcher",lastSeen:Date.now()});
       return res.json({ok:true,afk:false});
     }
 
@@ -159,6 +216,7 @@ app.post("/api/launcher/afk/toggle", protect, async (req,res)=>{
       await writeDbAsync(db);
       throw error;
     }
+    livePresence.set(userId,{...(livePresence.get(userId)||{}),status:"afk",lastSeen:Date.now()});
     return res.json({ok:true,afk:true,previousChannelId:currentId});
   }catch(error){
     console.error("Launcher AFK toggle:",error);

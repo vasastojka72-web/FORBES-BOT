@@ -35,7 +35,7 @@ function signAuthPayload(payload){if(!AUTH_SIGNING_SECRET)throw new Error("AUTH_
 function verifyAuthToken(token){try{if(!AUTH_SIGNING_SECRET||!token||!token.includes("."))return null;const [body,sig]=token.split(".");const expected=crypto.createHmac("sha256",AUTH_SIGNING_SECRET).update(body).digest("base64url");if(sig.length!==expected.length||!crypto.timingSafeEqual(Buffer.from(sig),Buffer.from(expected)))return null;const data=JSON.parse(Buffer.from(body,"base64url").toString("utf8"));if(!data?.id)return null;return data;}catch(e){return null;}}
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildPresences, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildPresences, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
   partials: [Partials.Channel, Partials.Message]
 });
 
@@ -76,6 +76,29 @@ function addUserNotification(db, notification = {}){
   return item;
 }
 
+const DEFAULT_NOTIFICATION_PREFERENCES = Object.freeze({
+  farmReports:true,
+  warnings:true,
+  fines:true,
+  paymentApprovals:true,
+  capts:true,
+  announcements:true
+});
+function notificationPreferenceKey(type){
+  const value=String(type||"");
+  if(value==="farm_report_status")return "farmReports";
+  if(value==="warning_created")return "warnings";
+  if(value==="fine_created")return "fines";
+  if(value==="fine_payment_status"||value==="warning_payment_status")return "paymentApprovals";
+  if(value==="capt_created")return "capts";
+  if(value==="announcement")return "announcements";
+  return "";
+}
+function userNotificationPreferences(db,userId){
+  const saved=db.notificationPreferences?.[String(userId)]||{};
+  return {...DEFAULT_NOTIFICATION_PREFERENCES,...saved};
+}
+
 function protect(req, res, next){
   const bearer=String(req.headers.authorization||"").replace(/^Bearer\s+/i,"");
   const verified=verifyAuthToken(bearer);
@@ -90,6 +113,58 @@ function protect(req, res, next){
   }
   return res.status(401).json({ok:false,error:"auth_required",message:"Увійдіть через Discord, щоб виконати цю дію."});
 }
+
+app.post("/api/launcher/afk/toggle", protect, async (req,res)=>{
+  const userId=String(req.user?.id||"");
+  const afkChannelId=String(process.env.DISCORD_AFK_CHANNEL_ID||"");
+  if(!userId)return res.status(401).json({ok:false,error:"AUTH_REQUIRED"});
+  if(!afkChannelId)return res.status(503).json({ok:false,error:"AFK_CHANNEL_NOT_CONFIGURED"});
+  try{
+    const guild=await client.guilds.fetch(CONFIG.guildId);
+    const member=await guild.members.fetch(userId);
+    const currentId=String(member.voice?.channelId||"");
+    const db=readDb();
+    db.afkSessions=db.afkSessions&&typeof db.afkSessions==="object"?db.afkSessions:{};
+    const session=db.afkSessions[userId];
+
+    if(session){
+      if(currentId!==afkChannelId){
+        delete db.afkSessions[userId];
+        await writeDbAsync(db);
+        return res.status(409).json({ok:false,error:"USER_NOT_IN_AFK"});
+      }
+      const previousId=String(session.previousVoiceChannelId||"");
+      const previous=previousId?await guild.channels.fetch(previousId).catch(()=>null):null;
+      if(!previous){
+        delete db.afkSessions[userId];
+        await writeDbAsync(db);
+        return res.status(409).json({ok:false,error:"PREVIOUS_CHANNEL_NOT_FOUND"});
+      }
+      await member.voice.setChannel(previous, "FORBES Launcher: AFK OFF");
+      delete db.afkSessions[userId];
+      await writeDbAsync(db);
+      return res.json({ok:true,afk:false});
+    }
+
+    if(!currentId)return res.status(409).json({ok:false,error:"USER_NOT_IN_VOICE"});
+    if(currentId===afkChannelId)return res.status(409).json({ok:false,error:"USER_NOT_IN_AFK"});
+    const afkChannel=await guild.channels.fetch(afkChannelId).catch(()=>null);
+    if(!afkChannel||!afkChannel.isVoiceBased())return res.status(503).json({ok:false,error:"AFK_CHANNEL_NOT_CONFIGURED"});
+    db.afkSessions[userId]={previousVoiceChannelId:currentId,createdAt:new Date().toISOString()};
+    await writeDbAsync(db);
+    try{
+      await member.voice.setChannel(afkChannel, "FORBES Launcher: AFK ON");
+    }catch(error){
+      delete db.afkSessions[userId];
+      await writeDbAsync(db);
+      throw error;
+    }
+    return res.json({ok:true,afk:true,previousChannelId:currentId});
+  }catch(error){
+    console.error("Launcher AFK toggle:",error);
+    return res.status(502).json({ok:false,error:"DISCORD_MOVE_FAILED"});
+  }
+});
 function ownerOnly(req, res, next){
   const userId=String(req.user?.id||"");
   if(!userId||String(userId)!==String(CONFIG.ownerId))return res.status(404).json({ok:false,error:"not_found"});
@@ -284,7 +359,12 @@ app.get("/api/launcher/notifications", protect, (req,res)=>{
     createdAt: item.createdAt || new Date(0).toISOString(),
     readAt: null
   }));
+  const preferences=userNotificationPreferences(db,discordUserId);
   notifications = [...notifications, ...announcements]
+    .filter(item=>{
+      const key=notificationPreferenceKey(item.type);
+      return !key || preferences[key]!==false;
+    })
     .sort((a,b)=>Date.parse(b.createdAt)-Date.parse(a.createdAt));
   if(since){
     const sinceTime = Date.parse(since);
@@ -292,6 +372,27 @@ app.get("/api/launcher/notifications", protect, (req,res)=>{
   }
   notifications = notifications.slice(0, limit);
   res.json({ok:true,notifications,unread:notifications.filter(item=>!item.readAt).length,serverTime:new Date().toISOString()});
+});
+
+app.get("/api/launcher/notification-preferences",protect,(req,res)=>{
+  const discordUserId=String(req.user?.id||"");
+  if(!discordUserId||req.user?.guest)return res.status(401).json({ok:false,error:"auth_required"});
+  const db=readDb();
+  res.json({ok:true,preferences:userNotificationPreferences(db,discordUserId)});
+});
+
+app.put("/api/launcher/notification-preferences",protect,async(req,res)=>{
+  const discordUserId=String(req.user?.id||"");
+  if(!discordUserId||req.user?.guest)return res.status(401).json({ok:false,error:"auth_required"});
+  const db=readDb();
+  db.notificationPreferences=db.notificationPreferences||{};
+  const next={...userNotificationPreferences(db,discordUserId)};
+  for(const key of Object.keys(DEFAULT_NOTIFICATION_PREFERENCES)){
+    if(typeof req.body?.[key]==="boolean")next[key]=req.body[key];
+  }
+  db.notificationPreferences[discordUserId]=next;
+  await writeDbAsync(db);
+  res.json({ok:true,preferences:next});
 });
 
 app.get("/api/launcher/statistics", protect, (req,res)=>{
@@ -334,6 +435,29 @@ app.get("/api/launcher/statistics", protect, (req,res)=>{
     },
     serverTime:new Date().toISOString()
   });
+});
+
+app.get("/api/launcher/capts/upcoming", protect, (req,res)=>{
+  const userId=String(req.user?.id||"");
+  if(!userId||req.user?.guest)return res.status(401).json({ok:false,error:"auth_required"});
+  const nowMs=Date.now();
+  const db=readDb();
+  const capts=(Array.isArray(db.capts)?db.capts:[])
+    .filter(c=>String(c.status||"").toLowerCase()!=="closed")
+    .filter(c=>(Array.isArray(c.yes)?c.yes:[]).map(String).includes(userId))
+    .map(c=>({capt:c,start:parseCaptDateTime(c)}))
+    .filter(x=>x.start&&x.start.getTime()>nowMs)
+    .sort((a,b)=>a.start-b.start)
+    .map(({capt,start})=>({
+      id:String(capt.id||""),
+      date:String(capt.date||""),
+      time:String(capt.time||""),
+      enemy:String(capt.enemy||""),
+      startsAt:start.toISOString(),
+      startsAtUnixMs:start.getTime(),
+      registered:true
+    }));
+  res.json({ok:true,capts,serverTime:new Date().toISOString()});
 });
 
 app.post("/api/launcher/notifications/:id/read", protect, async(req,res)=>{
@@ -1254,6 +1378,21 @@ app.post("/api/capts", protect, async (req,res)=>{
     const db=readDb();
     db.capts = Array.isArray(db.capts) ? db.capts : [];
     db.capts.unshift(item);
+    try{
+      const guildMembers=await member.guild.members.fetch();
+      for(const target of guildMembers.values()){
+        if(!target.user?.bot&&canUseCaptSignup(target)){
+          addUserNotification(db,{
+            discordUserId:target.id,
+            type:"capt_created",
+            title:"Створено запис на капт",
+            message:`${item.date||"Дата не вказана"} о ${item.time||"--:--"}. Проти: ${item.enemy||"не вказано"}.`,
+            entityType:"capt",
+            entityId:item.id
+          });
+        }
+      }
+    }catch(e){console.warn("capt launcher notifications failed",e?.message||e);}
     writeDb(db);
 
     const ch=await channel(CONFIG.channels.captSignup);
@@ -2440,6 +2579,15 @@ client.on("interactionCreate", async interaction=>{
         original.closedAt = now();
       }
 
+      addUserNotification(db,{
+        discordUserId:p.discordUserId||original?.discordUserId,
+        type:"warning_payment_status",
+        title:p.status==="approved"?"Зняття догани схвалено":"Зняття догани відхилено",
+        message:`Запит ${p.id} ${p.status==="approved"?"схвалено":"відхилено"}.`,
+        entityType:"warning_payment",
+        entityId:p.id
+      });
+
       await writeDbAsync(db);
 
       return finishReviewButton(interaction,{
@@ -2468,6 +2616,15 @@ client.on("interactionCreate", async interaction=>{
         original.status = action==="finepay_approve" ? "paid" : "unpaid";
         if(action==="finepay_approve") original.paidAt = now();
       }
+
+      addUserNotification(db,{
+        discordUserId:p.discordUserId||original?.discordUserId,
+        type:"fine_payment_status",
+        title:p.status==="paid"?"Оплату штрафу схвалено":"Оплату штрафу відхилено",
+        message:`Оплату ${p.id} ${p.status==="paid"?"схвалено":"відхилено"}.`,
+        entityType:"fine_payment",
+        entityId:p.id
+      });
 
       await writeDbAsync(db);
 
@@ -3704,6 +3861,7 @@ app.post("/api/announcements", protect, async (req,res)=>{
       type:String(req.body.type||"all"),
       title:String(req.body.title||"Оголошення").trim(),
       text:String(req.body.text||req.body.message||"").trim(),
+      delivery:{discord:true,launcher:true,windows:true},
       createdAt:now(),
       createdBy:req.user?.username||req.user?.name||req.body.createdBy||""
     };
@@ -3715,11 +3873,18 @@ app.post("/api/announcements", protect, async (req,res)=>{
     let discordSent = false;
     let discordError = "";
     try{
-      const ch = await channel(item.type === "farm" ? CONFIG.channels.farmAnnouncements : CONFIG.channels.announcements);
+      // Site announcements use the same family general chat as automatic
+      // birthday greetings. Launcher and Windows delivery use the same item ID.
+      const destinationChannelId = CONFIG.channels.generalChat;
+      const ch = await channel(destinationChannelId);
       if(!ch){
-        discordError = `Канал оголошень не знайдено: ${CONFIG.channels.announcements}`;
+        discordError = `Загальний чат не знайдено: ${destinationChannelId}`;
       }else{
-        await ch.send({embeds:[embed("📢 "+item.title, desc)]});
+        await ch.send({
+          content:"@everyone",
+          embeds:[embed(item.type === "farm" ? "🌾 "+item.title : "📢 "+item.title, desc)],
+          allowedMentions:{parse:["everyone"]}
+        });
         discordSent = true;
       }
     }catch(e){
@@ -3728,7 +3893,7 @@ app.post("/api/announcements", protect, async (req,res)=>{
     }
 
     const calendarSent = await sendForbesCalendarCopy("📅 Оголошення: "+item.title, desc);
-    res.json({ok:true,announcement:item,item,discordSent,discordError,calendarSent,calendarChannelId:CONFIG.channels.calendar});
+    res.json({ok:true,announcement:item,item,discordSent,discordError,discordChannelId:CONFIG.channels.generalChat,launcherQueued:true,windowsQueued:true,calendarSent,calendarChannelId:CONFIG.channels.calendar});
   }catch(e){
     console.error("POST /api/announcements failed:", e);
     res.status(500).json({ok:false,error:"announcement_create_failed",message:e.message});
@@ -4228,7 +4393,18 @@ app.delete("/api/v2/gallery/albums/:id",protect,async(req,res)=>{if(!(await fina
 app.post("/api/v2/music/tracks",protect,async(req,res)=>{if(!(await finalCanContent(req)))return denyPerm(res);try{const db=mediaDb(readDb());const media=await uploadBase64Media("track",req.body.file);let cover=null;if(req.body.cover)cover=await uploadBase64Media("cover",req.body.cover);const track={id:id("track"),title:req.body.title||media.name,author:req.body.author||"",url:media.publicUrl,media,coverUrl:cover?.publicUrl||"",cover,createdAt:new Date().toISOString()};db.musicTracks.unshift(track);await writeDbAsync(db);res.json({ok:true,track,tracks:db.musicTracks});}catch(e){res.status(400).json({ok:false,error:"track_save_failed",message:e.message});}});
 app.delete("/api/v2/music/tracks/:id",protect,async(req,res)=>{if(!(await finalCanContent(req)))return denyPerm(res);const db=mediaDb(readDb());const t=db.musicTracks.find(x=>String(x.id)===String(req.params.id));if(!t)return res.status(404).json({ok:false,error:"not_found"});backupMedia(db,"musicTrack",t,"delete");if(t.media?.bucket&&t.media?.path)await deleteMedia(t.media.bucket,t.media.path).catch(()=>{});if(t.cover?.bucket&&t.cover?.path)await deleteMedia(t.cover.bucket,t.cover.path).catch(()=>{});db.musicTracks=db.musicTracks.filter(x=>x!==t);await writeDbAsync(db);res.json({ok:true,tracks:db.musicTracks});});
 app.get("/api/v2/backups",protect,async(req,res)=>{if(!(await finalCanContent(req)))return denyPerm(res);const db=mediaDb(readDb());res.json({ok:true,backups:db.mediaBackups.slice(0,100)});});
-app.post("/api/v2/announcements/farm",protect,async(req,res)=>{if(!(await finalCanFarmAnn(req)))return denyPerm(res);const db=readDb();db.announcements=Array.isArray(db.announcements)?db.announcements:[];const item={id:id("ann"),type:"farm",title:req.body.title||"Оголошення для фарму",text:req.body.text||"",createdAt:now()};db.announcements.unshift(item);await writeDbAsync(db);const ch=await channel(CONFIG.channels.farmAnnouncements);if(ch)await ch.send({embeds:[embed(item.title,item.text)]});res.json({ok:true,item});});
+app.post("/api/v2/announcements/farm",protect,async(req,res)=>{
+  if(!(await finalCanFarmAnn(req)))return denyPerm(res);
+  const db=readDb();
+  db.announcements=Array.isArray(db.announcements)?db.announcements:[];
+  const item={id:id("ann"),type:"farm",title:req.body.title||"Оголошення для фарму",text:req.body.text||"",delivery:{discord:true,launcher:true,windows:true},createdAt:now(),createdBy:req.user?.username||req.user?.name||""};
+  if(!String(item.text).trim())return res.status(400).json({ok:false,error:"empty_text"});
+  db.announcements.unshift(item);
+  await writeDbAsync(db);
+  const ch=await channel(CONFIG.channels.generalChat);
+  if(ch)await ch.send({content:"@everyone",embeds:[embed("🌾 "+item.title,item.text)],allowedMentions:{parse:["everyone"]}});
+  res.json({ok:true,item,discordSent:Boolean(ch),discordChannelId:CONFIG.channels.generalChat,launcherQueued:true,windowsQueued:true});
+});
 
 
 /* === FORBES COMPLAINTS SYSTEM === */

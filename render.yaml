@@ -12,3 +12,5 @@ services:
         value: "502825427761365026"
       - key: PORT
         value: "10000"
+      - key: DISCORD_AFK_CHANNEL_ID
+        value: "1504875771066454117"

@@ -1501,7 +1501,24 @@ app.post("/api/farm-reports/:id/status", protect, async (req,res)=>{
 app.get("/api/capts", protect, async (req,res)=>{
   const member = await requireFamilyRole(req, res); if(!member) return;
   const db=readDb();
-  res.json({ok:true,capts:db.capts||[]});
+  const guild=await client.guilds.fetch(CONFIG.guildId).catch(()=>null);
+  const capts=[];
+  for(const capt of (db.capts||[])){
+    const participants=Array.isArray(capt.participants)?[...capt.participants]:[];
+    const knownIds=new Set(participants.map(p=>String(p?.discordUserId||p?.userId||p||"")));
+    const legacyIds=[...(capt.yes||[]),...(capt.no||[]),...(capt.maybe||[])].map(String).filter(Boolean);
+    for(const discordUserId of [...new Set(legacyIds)]){
+      if(knownIds.has(discordUserId)) continue;
+      const discordMember=guild?await guild.members.fetch(discordUserId).catch(()=>null):null;
+      participants.push({
+        discordUserId,
+        nickname:discordMember?.displayName||discordMember?.user?.username||"Учасник Discord"
+      });
+      knownIds.add(discordUserId);
+    }
+    capts.push({...capt,participants});
+  }
+  res.json({ok:true,capts});
 });
 
 
@@ -2936,10 +2953,10 @@ async function resolveMemberLabel(userId){
     const guild = await client.guilds.fetch(CONFIG.guildId);
     const member = await guild.members.fetch(userId).catch(()=>null);
     if(member){
-      return `${member.displayName} (<@${userId}>)`;
+      return member.displayName || member.user?.username || "Учасник Discord";
     }
   }catch(e){}
-  return `<@${userId}>`;
+  return "Учасник Discord";
 }
 
 async function formatCaptIds(ids){
@@ -3104,9 +3121,23 @@ async function postCaptList(captId){
   const ch = await channel(CONFIG.channels.captList);
   if(!ch) return false;
 
-  const yes = await formatCaptIds(c.yes || []);
-  const no = await formatCaptIds(c.no || []);
-  const maybe = await formatCaptIds(c.maybe || []);
+  const captLabel = async userId => {
+    const participant=(c.participants||[]).find(p=>String(p?.discordUserId||p?.userId||p||"")===String(userId));
+    const savedNickname=String(participant?.nickname||participant?.displayName||participant?.discordName||"").trim();
+    if(savedNickname) return savedNickname;
+    try{
+      const guild=await client.guilds.fetch(CONFIG.guildId);
+      const member=await guild.members.fetch(String(userId));
+      return member.displayName||member.user?.username||String(userId);
+    }catch(e){ return String(userId); }
+  };
+  const formatCaptMembers = async ids => {
+    if(!ids?.length) return "Поки нікого";
+    return (await Promise.all(ids.map(captLabel))).join("\n");
+  };
+  const yes = await formatCaptMembers(c.yes || []);
+  const no = await formatCaptMembers(c.no || []);
+  const maybe = await formatCaptMembers(c.maybe || []);
 
   await ch.send({
     embeds:[embed("📋 Список на капт",

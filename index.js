@@ -22,6 +22,7 @@ const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID || "";
 const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET || "";
 const DISCORD_REDIRECT_URI = process.env.DISCORD_REDIRECT_URI || "https://forbes-bot.onrender.com/auth/discord/callback";
 const NETLIFY_SITE_URL = process.env.NETLIFY_SITE_URL || process.env.SITE_ORIGIN || "https://fluffy-madeleine-c15914.netlify.app";
+const FORBES_DISCORD_GUILD_ID = process.env.FORBES_DISCORD_GUILD_ID || "1504699361668497419";
 
 app.disable("x-powered-by");
 app.use((req,res,next)=>{res.setHeader("X-Content-Type-Options","nosniff");res.setHeader("X-Frame-Options","DENY");res.setHeader("Referrer-Policy","strict-origin-when-cross-origin");res.setHeader("Permissions-Policy","camera=(), microphone=(), geolocation=(), payment=()");res.setHeader("Cache-Control","no-store");next();});
@@ -32,7 +33,7 @@ const rateBuckets=new Map();
 app.use((req,res,next)=>{if(req.path==="/health"||req.path==="/")return next();const key=(req.headers["x-forwarded-for"]||req.socket.remoteAddress||"unknown").toString().split(",")[0].trim();const n=Date.now(),max=req.method==="GET"?300:180;let x=rateBuckets.get(key);if(!x||n-x.start>60000)x={start:n,count:0};x.count++;rateBuckets.set(key,x);if(x.count>max)return res.status(429).json({ok:false,error:"rate_limited",message:"Забагато запитів. Спробуй через хвилину."});next();});
 const AUTH_SIGNING_SECRET=process.env.AUTH_SIGNING_SECRET||API_SECRET||DISCORD_CLIENT_SECRET;
 function signAuthPayload(payload){if(!AUTH_SIGNING_SECRET)throw new Error("AUTH_SIGNING_SECRET is missing");const body=Buffer.from(JSON.stringify(payload)).toString("base64url");const sig=crypto.createHmac("sha256",AUTH_SIGNING_SECRET).update(body).digest("base64url");return `${body}.${sig}`;}
-function verifyAuthToken(token){try{if(!AUTH_SIGNING_SECRET||!token||!token.includes("."))return null;const [body,sig]=token.split(".");const expected=crypto.createHmac("sha256",AUTH_SIGNING_SECRET).update(body).digest("base64url");if(sig.length!==expected.length||!crypto.timingSafeEqual(Buffer.from(sig),Buffer.from(expected)))return null;const data=JSON.parse(Buffer.from(body,"base64url").toString("utf8"));if(!data?.id)return null;return data;}catch(e){return null;}}
+function verifyAuthToken(token){try{if(!AUTH_SIGNING_SECRET||!token||!token.includes("."))return null;const [body,sig]=token.split(".");const expected=crypto.createHmac("sha256",AUTH_SIGNING_SECRET).update(body).digest("base64url");if(sig.length!==expected.length||!crypto.timingSafeEqual(Buffer.from(sig),Buffer.from(expected)))return null;const data=JSON.parse(Buffer.from(body,"base64url").toString("utf8"));if(!data?.id)return null;const issued=Number(data.iat||0);if(!issued||Date.now()-issued>30*24*60*60*1000)return null;return data;}catch(e){return null;}}
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildPresences, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
@@ -57,17 +58,26 @@ function nextSimpleId(db, prefix, collections = []){
 }
 
 function addUserNotification(db, notification = {}){
-  const discordUserId = String(notification.discordUserId || "").trim();
+  const discordUserId = String(notification.recipientDiscordUserId || notification.discordUserId || "").trim();
   if(!discordUserId) return null;
   db.notifications = Array.isArray(db.notifications) ? db.notifications : [];
+  const type = String(notification.type || "system");
+  const entityId = String(notification.sourceEntityId || notification.entityId || "");
+  const idempotencyKey = String(notification.idempotencyKey || `${discordUserId}:${type}:${entityId}`);
+  const existing = db.notifications.find(item => String(item.idempotencyKey || `${item.discordUserId}:${item.type}:${item.entityId}`) === idempotencyKey);
+  if(existing) return existing;
   const item = {
     id: id("notification"),
     discordUserId,
-    type: String(notification.type || "system"),
+    recipientDiscordUserId: discordUserId,
+    type,
     title: String(notification.title || "FORBES Launcher"),
     message: String(notification.message || ""),
     entityType: String(notification.entityType || ""),
-    entityId: String(notification.entityId || ""),
+    entityId,
+    sourceEntityId: entityId,
+    metadata: notification.metadata && typeof notification.metadata === "object" ? notification.metadata : {},
+    idempotencyKey,
     createdAt: new Date().toISOString(),
     readAt: null
   };
@@ -86,11 +96,11 @@ const DEFAULT_NOTIFICATION_PREFERENCES = Object.freeze({
 });
 function notificationPreferenceKey(type){
   const value=String(type||"");
-  if(value==="farm_report_status")return "farmReports";
+  if(value==="farm_report_status"||value==="farm_report_approved"||value==="farm_report_rejected")return "farmReports";
   if(value==="warning_created")return "warnings";
   if(value==="fine_created")return "fines";
-  if(value==="fine_payment_status"||value==="warning_payment_status")return "paymentApprovals";
-  if(value==="capt_created")return "capts";
+  if(value.startsWith("fine_payment_")||value.startsWith("warning_payment_")||value==="fine_payment_status"||value==="warning_payment_status")return "paymentApprovals";
+  if(value==="capt_created"||value==="capt_registered")return "capts";
   if(value==="announcement")return "announcements";
   return "";
 }
@@ -112,6 +122,41 @@ function protect(req, res, next){
     return next();
   }
   return res.status(401).json({ok:false,error:"auth_required",message:"Увійдіть через Discord, щоб виконати цю дію."});
+}
+
+function requireLauncherSession(req,res,next){
+  if(!req.user?.id||req.user?.guest)return res.status(401).json({ok:false,error:"AUTH_REQUIRED",message:"Потрібна повторна авторизація Discord."});
+  next();
+}
+
+const membershipCache=new Map();
+const MEMBERSHIP_CACHE_MS=Math.min(Math.max(Number(process.env.FORBES_MEMBERSHIP_CACHE_SECONDS||120),15),300)*1000;
+async function checkForbesMembership(userId,{fresh=false}={}){
+  userId=String(userId||"");
+  const cached=membershipCache.get(userId), nowMs=Date.now();
+  if(!fresh&&cached&&nowMs-cached.checkedAt<MEMBERSHIP_CACHE_MS)return cached;
+  try{
+    const guild=client.guilds.cache.get(FORBES_DISCORD_GUILD_ID)||await client.guilds.fetch(FORBES_DISCORD_GUILD_ID);
+    const member=await guild.members.fetch(userId).catch(error=>{
+      if(Number(error?.code)===10007||Number(error?.status)===404)return null;
+      throw error;
+    });
+    const result={allowed:Boolean(member),reason:member?"ALLOWED":"NOT_FORBES_MEMBER",checkedAt:nowMs};
+    membershipCache.set(userId,result);
+    return result;
+  }catch(error){
+    console.error("FORBES membership check:",error?.message||error);
+    return {allowed:false,reason:"DISCORD_API_ERROR",checkedAt:nowMs,temporary:true};
+  }
+}
+
+async function requireForbesMembership(req,res,next){
+  if(!req.user?.id||req.user?.guest)return res.status(401).json({ok:false,error:"AUTH_REQUIRED"});
+  const access=await checkForbesMembership(req.user.id);
+  if(access.temporary)return res.status(503).json({ok:false,error:"DISCORD_API_ERROR"});
+  if(!access.allowed)return res.status(403).json({ok:false,error:"FORBES_MEMBERSHIP_REQUIRED"});
+  req.forbesAccess=access;
+  next();
 }
 
 // Ephemeral live presence. Presence is deliberately not written to the main DB:
@@ -154,7 +199,7 @@ async function livePresenceSnapshot(){
   };
 }
 
-app.post("/api/presence/heartbeat", protect, async(req,res)=>{
+app.post("/api/presence/heartbeat", protect, requireForbesMembership, async(req,res)=>{
   const userId=String(req.user?.id||"");
   if(!userId||req.user?.guest)return res.status(401).json({ok:false,error:"auth_required"});
   const status=normalizedPresenceStatus(req.body?.status);
@@ -170,7 +215,7 @@ app.get("/api/presence/live", async(req,res)=>{
   res.json({ok:true,snapshot:await livePresenceSnapshot()});
 });
 
-app.post("/api/launcher/afk/toggle", protect, async (req,res)=>{
+app.post("/api/launcher/afk/toggle", protect, requireForbesMembership, async (req,res)=>{
   const userId=String(req.user?.id||"");
   const afkChannelId=String(process.env.DISCORD_AFK_CHANNEL_ID||"");
   if(!userId)return res.status(401).json({ok:false,error:"AUTH_REQUIRED"});
@@ -396,7 +441,15 @@ function _autoCollectPlayersFromAny(map, obj, source){
 app.get("/", (req,res)=>res.json({ok:true,name:"FORBES BOT API",time:now()}));
 app.get("/health", (req,res)=>res.json({ok:true,botReady:client.isReady(),time:now()}));
 
-app.get("/api/launcher/notifications", protect, (req,res)=>{
+app.get("/api/launcher/access",protect,requireLauncherSession,async(req,res)=>{
+  const access=await checkForbesMembership(req.user.id,{fresh:true});
+  const checkedAt=new Date(access.checkedAt).toISOString();
+  if(access.temporary)return res.status(503).json({ok:false,allowed:false,reason:"DISCORD_API_ERROR",checkedAt});
+  const validUntil=new Date(access.checkedAt+24*60*60*1000).toISOString();
+  res.json({ok:true,allowed:access.allowed,reason:access.reason,checkedAt,validUntil});
+});
+
+app.get("/api/launcher/notifications", protect, requireForbesMembership, (req,res)=>{
   const discordUserId = String(req.user?.id || "");
   if(!discordUserId || req.user?.guest){
     return res.status(401).json({ok:false,error:"auth_required",message:"Discord authorization is required."});
@@ -406,7 +459,11 @@ app.get("/api/launcher/notifications", protect, (req,res)=>{
   const db = readDb();
   let notifications = (Array.isArray(db.notifications) ? db.notifications : [])
     .filter(item => String(item.discordUserId) === discordUserId);
-  const announcements = (Array.isArray(db.announcements) ? db.announcements : []).map(item => ({
+  /* Personal notifications and announcements are intentionally separate feeds.
+     Keep this legacy mapper disabled so announcement unread state cannot pollute
+     the personal badge. */
+  const announcements = [];
+  /* (Array.isArray(db.announcements) ? db.announcements : []).map(item => ({
     id: `announcement:${item.id}`,
     discordUserId,
     type: "announcement",
@@ -416,7 +473,7 @@ app.get("/api/launcher/notifications", protect, (req,res)=>{
     entityId: String(item.id || ""),
     createdAt: item.createdAt || new Date(0).toISOString(),
     readAt: null
-  }));
+  })); */
   const preferences=userNotificationPreferences(db,discordUserId);
   notifications = [...notifications, ...announcements]
     .filter(item=>{
@@ -432,14 +489,14 @@ app.get("/api/launcher/notifications", protect, (req,res)=>{
   res.json({ok:true,notifications,unread:notifications.filter(item=>!item.readAt).length,serverTime:new Date().toISOString()});
 });
 
-app.get("/api/launcher/notification-preferences",protect,(req,res)=>{
+app.get("/api/launcher/notification-preferences",protect,requireForbesMembership,(req,res)=>{
   const discordUserId=String(req.user?.id||"");
   if(!discordUserId||req.user?.guest)return res.status(401).json({ok:false,error:"auth_required"});
   const db=readDb();
   res.json({ok:true,preferences:userNotificationPreferences(db,discordUserId)});
 });
 
-app.put("/api/launcher/notification-preferences",protect,async(req,res)=>{
+app.put("/api/launcher/notification-preferences",protect,requireForbesMembership,async(req,res)=>{
   const discordUserId=String(req.user?.id||"");
   if(!discordUserId||req.user?.guest)return res.status(401).json({ok:false,error:"auth_required"});
   const db=readDb();
@@ -453,7 +510,7 @@ app.put("/api/launcher/notification-preferences",protect,async(req,res)=>{
   res.json({ok:true,preferences:next});
 });
 
-app.get("/api/launcher/statistics", protect, (req,res)=>{
+app.get("/api/launcher/statistics", protect, requireForbesMembership, (req,res)=>{
   const discordUserId = String(req.user?.id || "");
   if(!discordUserId || req.user?.guest){
     return res.status(401).json({ok:false,error:"auth_required",message:"Discord authorization is required."});
@@ -495,7 +552,7 @@ app.get("/api/launcher/statistics", protect, (req,res)=>{
   });
 });
 
-app.get("/api/launcher/capts/upcoming", protect, (req,res)=>{
+app.get("/api/launcher/capts/upcoming", protect, requireForbesMembership, (req,res)=>{
   const userId=String(req.user?.id||"");
   if(!userId||req.user?.guest)return res.status(401).json({ok:false,error:"auth_required"});
   const nowMs=Date.now();
@@ -518,7 +575,7 @@ app.get("/api/launcher/capts/upcoming", protect, (req,res)=>{
   res.json({ok:true,capts,serverTime:new Date().toISOString()});
 });
 
-app.post("/api/launcher/notifications/:id/read", protect, async(req,res)=>{
+app.post("/api/launcher/notifications/:id/read", protect, requireForbesMembership, async(req,res)=>{
   const discordUserId = String(req.user?.id || "");
   if(!discordUserId || req.user?.guest) return res.status(401).json({ok:false,error:"auth_required"});
   const db = readDb();
@@ -529,6 +586,71 @@ app.post("/api/launcher/notifications/:id/read", protect, async(req,res)=>{
   await writeDbAsync(db);
   res.json({ok:true,notification:item});
 });
+
+// Session-scoped capt feed. The Discord ID always comes from the signed
+// Launcher session; callers cannot query another member's registrations.
+app.get("/api/launcher/capts/me/upcoming",protect,requireForbesMembership,(req,res)=>{
+  const userId=String(req.user?.id||"");
+  if(!userId||req.user?.guest)return res.status(401).json({ok:false,error:"auth_required"});
+  const db=readDb(), nowMs=Date.now();
+  const capts=(Array.isArray(db.capts)?db.capts:[])
+    .filter(c=>String(c.status||"").toLowerCase()!=="closed")
+    .filter(c=>(c.participants||[]).some(p=>String(p.discordUserId||p.userId||p)===userId&&String(p.status||"registered")==="registered")||(c.yes||[]).map(String).includes(userId))
+    .map(c=>({capt:c,start:parseCaptDateTime(c)}))
+    .filter(x=>x.start&&x.start.getTime()>nowMs)
+    .sort((a,b)=>a.start-b.start)
+    .map(({capt,start})=>{
+      const participant=(capt.participants||[]).find(p=>String(p.discordUserId||p.userId||p)===userId);
+      return {id:String(capt.id||""),captId:String(capt.id||""),date:String(capt.date||""),time:String(capt.time||""),enemy:String(capt.enemy||""),startsAt:start.toISOString(),startsAtUnixMs:start.getTime(),registered:true,status:"registered",registeredAt:participant?.registeredAt||capt.createdAt||""};
+    });
+  res.json({ok:true,capts,serverTime:new Date().toISOString()});
+});
+
+app.patch("/api/launcher/notifications/:id/read", protect, requireForbesMembership, async(req,res)=>{
+  const userId=String(req.user?.id||"");
+  if(!userId||req.user?.guest)return res.status(401).json({ok:false,error:"auth_required"});
+  const db=readDb();
+  const item=(db.notifications||[]).find(x=>String(x.id)===String(req.params.id)&&String(x.discordUserId)===userId);
+  if(!item)return res.status(404).json({ok:false,error:"notification_not_found"});
+  item.readAt=item.readAt||new Date().toISOString();
+  await writeDbAsync(db);
+  res.json({ok:true,notification:item});
+});
+
+async function currentLauncherRoleIds(req){
+  try{
+    const member=await apiMemberFromRequest(req);
+    if(member?.roles?.cache)return [...member.roles.cache.keys()].map(String);
+  }catch(e){console.warn("launcher role refresh failed",e?.message||e);}
+  return (Array.isArray(req.user?.roles)?req.user.roles:[]).map(role=>String(role?.id||role));
+}
+
+app.get("/api/launcher/announcements",protect,requireForbesMembership,async(req,res)=>{
+  const userId=String(req.user?.id||"");
+  if(!userId||req.user?.guest)return res.status(401).json({ok:false,error:"auth_required"});
+  const db=readDb(), roles=new Set(await currentLauncherRoleIds(req));
+  const reads=new Set(Array.isArray(db.announcementReads?.[userId])?db.announcementReads[userId]:[]);
+  const limit=Math.min(Math.max(Number(req.query.limit||50),1),100);
+  const announcements=(db.announcements||[]).filter(item=>{
+    const target=String(item.targetType||"ALL").toUpperCase();
+    return target==="ALL"||(target==="ROLES"&&(item.targetRoleIds||[]).some(role=>roles.has(String(role))));
+  }).sort((a,b)=>Date.parse(b.createdAt||0)-Date.parse(a.createdAt||0)).slice(0,limit)
+    .map(item=>({...item,message:item.message||item.text||"",readAt:reads.has(String(item.id))?"read":null}));
+  res.json({ok:true,announcements,unread:announcements.filter(item=>!item.readAt).length,serverTime:new Date().toISOString()});
+});
+
+async function markAnnouncementRead(req,res){
+  const userId=String(req.user?.id||"");
+  if(!userId||req.user?.guest)return res.status(401).json({ok:false,error:"auth_required"});
+  const db=readDb();
+  if(!(db.announcements||[]).some(x=>String(x.id)===String(req.params.id)))return res.status(404).json({ok:false,error:"announcement_not_found"});
+  db.announcementReads=db.announcementReads||{};
+  const reads=new Set(Array.isArray(db.announcementReads[userId])?db.announcementReads[userId]:[]);
+  reads.add(String(req.params.id)); db.announcementReads[userId]=[...reads].slice(-2000);
+  await writeDbAsync(db); res.json({ok:true,id:String(req.params.id)});
+}
+app.post("/api/launcher/announcements/:id/read",protect,requireForbesMembership,markAnnouncementRead);
+app.patch("/api/launcher/announcements/:id/read",protect,requireForbesMembership,markAnnouncementRead);
 
 // Discord OAuth login
 app.get("/auth/discord", (req, res) => {
@@ -1356,12 +1478,16 @@ app.post("/api/farm-reports/:id/status", protect, async (req,res)=>{
     report.each = Number(report.each || ((report.players||[]).length ? Math.floor(report.amount*0.8/(report.players||[]).length) : 0));
     addUserNotification(db, {
       discordUserId: report.discordUserId,
-      type: "farm_report_status",
+      type: status === "approved" ? "farm_report_approved" : status === "rejected" ? "farm_report_rejected" : "farm_report_status",
       title: status === "approved" ? "Звіт схвалено" : status === "rejected" ? "Звіт відхилено" : "Статус звіту змінено",
       message: `Фарм-звіт ${report.id}: ${status}`,
       entityType: "farm_report",
       entityId: report.id
     });
+    for(const player of (report.players||[])){
+      const playerId=String(player?.discordUserId||player?.userId||"");
+      if(playerId&&playerId!==String(report.discordUserId||""))addUserNotification(db,{discordUserId:playerId,type:status==="approved"?"farm_report_approved":"farm_report_rejected",title:status==="approved"?"Фарм-звіт схвалено":"Фарм-звіт відхилено",message:`Фарм-звіт ${report.id}: ${status}`,entityType:"farm_report",entityId:report.id});
+    }
     writeDb(db);
 
     debugLog("farm_status_manual_change", {id:report.id, oldStatus, newStatus:status, by:member.id});
@@ -2581,12 +2707,16 @@ client.on("interactionCreate", async interaction=>{
       r.contractAmount=Number(r.contractAmount || r.amount || 0);
       addUserNotification(db, {
         discordUserId: r.discordUserId,
-        type: "farm_report_status",
+        type: r.status === "approved" ? "farm_report_approved" : "farm_report_rejected",
         title: r.status === "approved" ? "Звіт схвалено" : "Звіт відхилено",
         message: `Фарм-звіт ${r.id} ${r.status === "approved" ? "схвалено" : "відхилено"} модератором.`,
         entityType: "farm_report",
         entityId: r.id
       });
+      for(const player of (r.players||[])){
+        const playerId=String(player?.discordUserId||player?.userId||"");
+        if(playerId&&playerId!==String(r.discordUserId||""))addUserNotification(db,{discordUserId:playerId,type:r.status==="approved"?"farm_report_approved":"farm_report_rejected",title:r.status==="approved"?"Фарм-звіт схвалено":"Фарм-звіт відхилено",message:`Фарм-звіт ${r.id}: ${r.status}`,entityType:"farm_report",entityId:r.id});
+      }
       await writeDbAsync(db);
       if(typeof addLog === "function") addLog("Farm-звіт перевірено", {id:r.id,status:r.status,by:interaction.user.id});
       return finishReviewButton(interaction,{
@@ -2608,12 +2738,19 @@ client.on("interactionCreate", async interaction=>{
       c.yes=(c.yes||[]).filter(x=>x!==interaction.user.id);
       c.no=(c.no||[]).filter(x=>x!==interaction.user.id);
       c.maybe=(c.maybe||[]).filter(x=>x!==interaction.user.id);
+      c.participants=Array.isArray(c.participants)?c.participants:[];
+      c.participants=c.participants.filter(p=>String(p.discordUserId||p.userId||p)!==interaction.user.id);
 
-      if(action==="capt_yes") c.yes.push(interaction.user.id);
+      if(action==="capt_yes"){
+        c.yes.push(interaction.user.id);
+        const start=parseCaptDateTime(c);
+        c.participants.push({captId:c.id,discordUserId:interaction.user.id,nickname:member.displayName||interaction.user.username,registeredAt:new Date().toISOString(),startsAt:start?.toISOString()||"",status:"registered"});
+        addUserNotification(db,{discordUserId:interaction.user.id,type:"capt_registered",title:"Ви записані на капт",message:`Початок: ${c.time||"--:--"}. Проти: ${c.enemy||"не вказано"}.`,entityType:"capt",entityId:c.id});
+      }
       if(action==="capt_no") c.no.push(interaction.user.id);
       if(action==="capt_maybe") c.maybe.push(interaction.user.id);
 
-      writeDb(db);
+      await writeDbAsync(db);
       return interaction.reply({content:"✅ Твій вибір записано",ephemeral:true});
     }
 
@@ -2639,7 +2776,7 @@ client.on("interactionCreate", async interaction=>{
 
       addUserNotification(db,{
         discordUserId:p.discordUserId||original?.discordUserId,
-        type:"warning_payment_status",
+        type:p.status==="approved"?"warning_payment_approved":"warning_payment_rejected",
         title:p.status==="approved"?"Зняття догани схвалено":"Зняття догани відхилено",
         message:`Запит ${p.id} ${p.status==="approved"?"схвалено":"відхилено"}.`,
         entityType:"warning_payment",
@@ -2677,7 +2814,7 @@ client.on("interactionCreate", async interaction=>{
 
       addUserNotification(db,{
         discordUserId:p.discordUserId||original?.discordUserId,
-        type:"fine_payment_status",
+        type:p.status==="paid"?"fine_payment_approved":"fine_payment_rejected",
         title:p.status==="paid"?"Оплату штрафу схвалено":"Оплату штрафу відхилено",
         message:`Оплату ${p.id} ${p.status==="paid"?"схвалено":"відхилено"}.`,
         entityType:"fine_payment",
@@ -2851,6 +2988,36 @@ function parseCaptDateTime(c){
   }
 }
 
+async function sendCaptReminder(captId,minutes){
+  const db=readDb();
+  const capt=(db.capts||[]).find(x=>String(x.id)===String(captId));
+  if(!capt||String(capt.status||"").toLowerCase()==="closed")return false;
+  const start=parseCaptDateTime(capt);
+  if(!start)return false;
+  const reminderAt=start.getTime()-minutes*60*1000;
+  if(Date.now()<reminderAt||Date.now()>start.getTime())return false;
+  db.captReminderDeliveries=db.captReminderDeliveries||{};
+  const deliveryKey=`${capt.id}:${minutes}min`;
+  if(db.captReminderDeliveries[deliveryKey])return false;
+  const participantRecords=(capt.participants||[]).filter(p=>String(p.status||"registered")==="registered"&&(!p.registeredAt||Date.parse(p.registeredAt)<=reminderAt));
+  const participantIds=[...new Set(participantRecords.map(p=>String(p.discordUserId||p.userId||"")).filter(Boolean))];
+  // Backward compatibility for capts created before participant records existed.
+  if(!participantRecords.length)participantIds.push(...(capt.yes||[]).map(String).filter(Boolean));
+  const uniqueIds=[...new Set(participantIds)];
+  if(!uniqueIds.length){
+    db.captReminderDeliveries[deliveryKey]={sentAt:new Date().toISOString(),recipientCount:0,skipped:"no_participants"};
+    await writeDbAsync(db); return false;
+  }
+  const ch=await channel(CONFIG.channels.captReminder);
+  if(!ch)return false;
+  const mentions=uniqueIds.map(userId=>`<@${userId}> | ID: ${userId}`).join("\n");
+  await ch.send({content:uniqueIds.map(userId=>`<@${userId}>`).join(" "),allowedMentions:{users:uniqueIds},embeds:[embed(`⚔ КАПТ ЧЕРЕЗ ${minutes} ХВИЛИН`,`**Початок:** ${capt.time||"--:--"}\n**Проти:** ${capt.enemy||"не вказано"}\n\n**Записані:**\n${mentions}`)]});
+  db.captReminderDeliveries[deliveryKey]={sentAt:new Date().toISOString(),recipientCount:uniqueIds.length,channelId:CONFIG.channels.captReminder};
+  await writeDbAsync(db);
+  console.log("capt reminder sent",{captId:capt.id,minutes,recipientCount:uniqueIds.length});
+  return true;
+}
+
 async function sendCaptReminder15(captId){
   const db = readDb();
   const c = db.capts.find(x => x.id === captId);
@@ -2883,6 +3050,9 @@ async function sendCaptReminder15(captId){
 }
 
 function scheduleCaptReminder(captId){
+  // Periodic persisted scheduler below handles both thresholds and survives restarts.
+  checkCaptReminders().catch(console.error);
+  return;
   const db = readDb();
   const c = db.capts.find(x => x.id === captId);
   if(!c) return;
@@ -2909,14 +3079,12 @@ async function checkCaptReminders(){
     const nowMs = Date.now();
 
     for(const c of (db.capts || [])){
-      if(!c || c.status === "closed" || c.reminded15) continue;
+      if(!c || c.status === "closed") continue;
       const dt = parseCaptDateTime(c);
       if(!dt) continue;
-
-      const remindAt = dt.getTime() - 15 * 60 * 1000;
-      // Send when current time is between 15 minutes before and start time.
-      if(nowMs >= remindAt && nowMs <= dt.getTime()){
-        await sendCaptReminder15(c.id);
+      for(const minutes of [20,10]){
+        const remindAt=dt.getTime()-minutes*60*1000;
+        if(nowMs>=remindAt&&nowMs<=dt.getTime())await sendCaptReminder(c.id,minutes);
       }
     }
   }catch(e){
@@ -2925,16 +3093,7 @@ async function checkCaptReminders(){
 }
 
 function restoreCaptReminderTimers(){
-  try{
-    const db = readDb();
-    for(const c of (db.capts || [])){
-      if(c && c.status !== "closed" && !c.reminded15){
-        scheduleCaptReminder(c.id);
-      }
-    }
-  }catch(e){
-    console.error("restoreCaptReminderTimers error:", e);
-  }
+  checkCaptReminders().catch(e=>console.error("restoreCaptReminderTimers error:",e));
 }
 
 async function postCaptList(captId){
@@ -3914,14 +4073,22 @@ app.post("/api/announcements", protect, async (req,res)=>{
     if(annType==="farm" ? !canFarm : !canGeneral) return res.status(403).json({ok:false,error:"no_permission",message:"Немає прав."});
     const db=readDb();
     db.announcements = Array.isArray(db.announcements) ? db.announcements : [];
+    const requestedRoles=Array.isArray(req.body.targetRoleIds)?req.body.targetRoleIds.map(String).filter(Boolean):[];
+    const targetType=String(req.body.targetType||(requestedRoles.length?"ROLES":"ALL")).toUpperCase();
+    if(!["ALL","ROLES"].includes(targetType))return res.status(400).json({ok:false,error:"bad_target_type"});
+    if(targetType==="ROLES"&&!requestedRoles.length)return res.status(400).json({ok:false,error:"target_roles_required"});
     const item={
       id:id("ann"),
       type:String(req.body.type||"all"),
       title:String(req.body.title||"Оголошення").trim(),
       text:String(req.body.text||req.body.message||"").trim(),
+      message:String(req.body.text||req.body.message||"").trim(),
+      targetType,
+      targetRoleIds:targetType==="ROLES"?requestedRoles:[],
+      priority:String(req.body.priority||"normal").toLowerCase(),
       delivery:{discord:true,launcher:true,windows:true},
-      createdAt:now(),
-      createdBy:req.user?.username||req.user?.name||req.body.createdBy||""
+      createdAt:new Date().toISOString(),
+      createdBy:String(req.user?.id||req.user?.username||req.user?.name||req.body.createdBy||"")
     };
     if(!item.text) return res.status(400).json({ok:false,error:"empty_text",message:"Текст оголошення порожній."});
     db.announcements.unshift(item);
@@ -3938,10 +4105,11 @@ app.post("/api/announcements", protect, async (req,res)=>{
       if(!ch){
         discordError = `Загальний чат не знайдено: ${destinationChannelId}`;
       }else{
+        const roleMentions=item.targetType==="ROLES"?item.targetRoleIds.map(roleId=>`<@&${roleId}>`).join(" "):"@everyone";
         await ch.send({
-          content:"@everyone",
+          content:roleMentions,
           embeds:[embed(item.type === "farm" ? "🌾 "+item.title : "📢 "+item.title, desc)],
-          allowedMentions:{parse:["everyone"]}
+          allowedMentions:item.targetType==="ROLES"?{roles:item.targetRoleIds}:{parse:["everyone"]}
         });
         discordSent = true;
       }
@@ -4495,6 +4663,11 @@ function ensureComplaintsDb(db){
   db.complaintBackups=Array.isArray(db.complaintBackups)?db.complaintBackups:[];
   return db;
 }
+function discordIdForStaticId(db,staticId){
+  const wanted=String(staticId||"");
+  const member=(db.members||[]).find(item=>String(item.staticId||item.playerId||item.gameId||"")===wanted);
+  return String(member?.discordUserId||member?.userId||member?.discordId||"");
+}
 function nextComplaintNumber(db){
   const max=(db.complaints||[]).reduce((m,c)=>Math.max(m,Number(String(c.number||"").replace(/\D/g,""))||0),0);
   return `SC-${String(max+1).padStart(4,"0")}`;
@@ -4528,7 +4701,10 @@ app.post("/api/complaints", protect, async(req,res)=>{
       text:String(req.body.text||"").trim(),evidenceUrl:String(req.body.evidenceUrl||"").trim(),timecode:String(req.body.timecode||"").trim(),createdAt:complaintIsoNow()
     };
     if(!item.authorNick||!item.authorId||!item.targetNick||!item.targetId||!item.text||!item.evidenceUrl)return res.status(400).json({ok:false,error:"required_fields",message:"Заповни всі обов’язкові поля."});
-    db.complaints.unshift(item); const wr=typeof writeDbAsync==="function"?await writeDbAsync(db):(writeDb(db),{ok:true});
+    db.complaints.unshift(item);
+    const targetDiscordId=discordIdForStaticId(db,item.targetId);
+    if(targetDiscordId)addUserNotification(db,{discordUserId:targetDiscordId,type:"complaint_against_you",title:"На вас подано скаргу",message:`Скарга ${item.number} очікує розгляду.`,entityType:"complaint",entityId:item.id});
+    const wr=typeof writeDbAsync==="function"?await writeDbAsync(db):(writeDb(db),{ok:true});
     if(!wr.ok)return res.status(500).json({ok:false,error:"db_write_failed",message:wr.error});
     res.json({ok:true,complaint:item});
   }catch(e){res.status(500).json({ok:false,error:"complaint_submit_failed",message:e.message});}
@@ -4544,15 +4720,20 @@ app.post("/api/complaints/:id/review", protect, async(req,res)=>{
     if(!["innocent","fine","warning"].includes(punishment)||!["approved","rejected"].includes(decision)||!reason)return res.status(400).json({ok:false,error:"bad_review"});
     if(punishment==="fine"&&decision==="approved"&&!amount)return res.status(400).json({ok:false,error:"amount_required"});
     c.status="reviewed";c.punishment=punishment;c.decision=decision;c.reason=reason;c.amount=amount||0;c.reviewedAt=complaintIsoNow();c.reviewedById=member.id;c.reviewedByName=member.displayName||req.user?.username||"Адміністратор";
+    addUserNotification(db,{discordUserId:c.authorDiscordId,type:"complaint_resolved",title:"Скаргу розглянуто",message:`Скарга ${c.number}: ${decision}. ${reason}`,entityType:"complaint",entityId:c.id});
     let createdPunishment=null;
     if(decision==="approved"&&punishment==="fine"){
       db.fines=Array.isArray(db.fines)?db.fines:[];
       createdPunishment={id:id("fine"),nickname:c.targetNick,staticId:c.targetId,amount,reason,complaintId:c.id,status:"unpaid",createdAt:now(),createdBy:c.reviewedByName}; db.fines.unshift(createdPunishment);
+      const targetDiscordId=discordIdForStaticId(db,c.targetId);
+      if(targetDiscordId){createdPunishment.discordUserId=targetDiscordId;addUserNotification(db,{discordUserId:targetDiscordId,type:"fine_created",title:"Вам виписано штраф",message:`Сума: ${money(amount)}. Причина: ${reason}`,entityType:"fine",entityId:createdPunishment.id});}
       const ch=await channel(CONFIG.channels.fines); if(ch)await ch.send({embeds:[embed("🚨 Штраф за скаргою",`**Скарга:** ${c.number}\n**Гравець:** ${c.targetNick} | ${c.targetId}\n**Сума:** ${money(amount)}\n**Причина:** ${reason}\n**Видав:** ${c.reviewedByName}`)]});
     }
     if(decision==="approved"&&punishment==="warning"){
       db.warnings=Array.isArray(db.warnings)?db.warnings:[]; const expires=new Date(Date.now()+CONFIG.warnings.days*86400000).toISOString();
       createdPunishment={id:id("warn"),nickname:c.targetNick,staticId:c.targetId,reason,complaintId:c.id,status:"active",expiresAt:expires,createdAt:now(),createdBy:c.reviewedByName}; db.warnings.unshift(createdPunishment);
+      const targetDiscordId=discordIdForStaticId(db,c.targetId);
+      if(targetDiscordId){createdPunishment.discordUserId=targetDiscordId;addUserNotification(db,{discordUserId:targetDiscordId,type:"warning_created",title:"Вам видано догану",message:`Причина: ${reason}`,entityType:"warning",entityId:createdPunishment.id});}
       const ch=await channel(CONFIG.channels.warnings); if(ch)await ch.send({embeds:[embed("🚫 Догана за скаргою",`**Скарга:** ${c.number}\n**Гравець:** ${c.targetNick} | ${c.targetId}\n**Причина:** ${reason}\n**Видав:** ${c.reviewedByName}`)]});
     }
     const wr=typeof writeDbAsync==="function"?await writeDbAsync(db):(writeDb(db),{ok:true}); if(!wr.ok)return res.status(500).json({ok:false,error:"db_write_failed",message:wr.error});

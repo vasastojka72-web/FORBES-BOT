@@ -52,7 +52,7 @@ export const CONFIG = {
     botCommands: "1504883238643044463",
     captSignup: "1505002781847720047",
     captList: "1505002905135218749",
-    captReminder: "1505002988429901935",
+    captReminder: process.env.CAPT_REMINDER_CHANNEL_ID || "1505002988429901935",
     captStats: "1504874503241732147",
     announcements: "1505075081926414377",
     calendar: "1505075126113275944",

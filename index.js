@@ -4705,7 +4705,9 @@ app.get("/api/media-proxy", async (req,res)=>{
       if(value) res.set(name,value);
     }
     if(!res.get("Accept-Ranges")) res.set("Accept-Ranges","bytes");
-    res.set("Access-Control-Allow-Origin","*");
+    // The global CORS middleware already returns the exact allowed origin.
+    // Do not overwrite it with "*": credentialed browser requests reject
+    // wildcard origins even when the media response itself is successful.
     res.set("Cross-Origin-Resource-Policy","cross-origin");
     res.set("Cache-Control","public, max-age=300");
 

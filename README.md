@@ -54,3 +54,14 @@ V5: автопарк підтримує детальні поля карток �
 V9: signed Discord auth, owner-only admin API, CORS, rate limit, security headers, application/capt/discipline permissions fixed. Re-login after deploy.
 
 V10: підписаний Discord-токен без автоматичного строку дії. Він перестає працювати після виходу користувача або зміни AUTH_SIGNING_SECRET. Подання фарм-звітів доступне всім авторизованим учасникам, включно з каптерами.
+# Launcher Web SSO
+
+The Launcher requests a one-time 60-second ticket through
+`POST /api/launcher/web-session`. The ticket is exchanged by WebView2 at
+`GET /auth/launcher`; the backend then creates the `forbes_web_session`
+Secure/HttpOnly cookie and redirects to the website. The persistent Launcher
+token is never placed in a URL.
+
+Render must keep the existing `AUTH_SIGNING_SECRET`. Set
+`PUBLIC_API_URL=https://forbes-bot.onrender.com` and include
+`https://forbes-fam.netlify.app` in `ALLOWED_ORIGINS`. No new secret is needed.

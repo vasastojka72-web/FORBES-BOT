@@ -27,13 +27,34 @@ const FORBES_DISCORD_GUILD_ID = process.env.FORBES_DISCORD_GUILD_ID || "15046993
 app.disable("x-powered-by");
 app.use((req,res,next)=>{res.setHeader("X-Content-Type-Options","nosniff");res.setHeader("X-Frame-Options","DENY");res.setHeader("Referrer-Policy","strict-origin-when-cross-origin");res.setHeader("Permissions-Policy","camera=(), microphone=(), geolocation=(), payment=()");res.setHeader("Cache-Control","no-store");next();});
 const allowedOrigins=String(process.env.ALLOWED_ORIGINS||SITE_ORIGIN||"").split(",").map(x=>x.trim()).filter(Boolean);
-app.use(cors({origin(origin,cb){if(!origin||allowedOrigins.includes("*")||allowedOrigins.includes(origin))return cb(null,true);return cb(new Error("CORS blocked"));}}));
+app.use(cors({credentials:true,origin(origin,cb){if(!origin||allowedOrigins.includes("*")||allowedOrigins.includes(origin))return cb(null,true);return cb(new Error("CORS blocked"));}}));
 app.use(express.json({ limit: "50mb" }));
 const rateBuckets=new Map();
 app.use((req,res,next)=>{if(req.path==="/health"||req.path==="/")return next();const key=(req.headers["x-forwarded-for"]||req.socket.remoteAddress||"unknown").toString().split(",")[0].trim();const n=Date.now(),max=req.method==="GET"?300:180;let x=rateBuckets.get(key);if(!x||n-x.start>60000)x={start:n,count:0};x.count++;rateBuckets.set(key,x);if(x.count>max)return res.status(429).json({ok:false,error:"rate_limited",message:"Забагато запитів. Спробуй через хвилину."});next();});
 const AUTH_SIGNING_SECRET=process.env.AUTH_SIGNING_SECRET||API_SECRET||DISCORD_CLIENT_SECRET;
 function signAuthPayload(payload){if(!AUTH_SIGNING_SECRET)throw new Error("AUTH_SIGNING_SECRET is missing");const body=Buffer.from(JSON.stringify(payload)).toString("base64url");const sig=crypto.createHmac("sha256",AUTH_SIGNING_SECRET).update(body).digest("base64url");return `${body}.${sig}`;}
 function verifyAuthToken(token){try{if(!AUTH_SIGNING_SECRET||!token||!token.includes("."))return null;const [body,sig]=token.split(".");const expected=crypto.createHmac("sha256",AUTH_SIGNING_SECRET).update(body).digest("base64url");if(sig.length!==expected.length||!crypto.timingSafeEqual(Buffer.from(sig),Buffer.from(expected)))return null;const data=JSON.parse(Buffer.from(body,"base64url").toString("utf8"));if(!data?.id)return null;const issued=Number(data.iat||0);if(!issued||Date.now()-issued>30*24*60*60*1000)return null;return data;}catch(e){return null;}}
+
+const WEB_SESSION_COOKIE="forbes_web_session";
+const WEB_SSO_TTL_MS=60*1000;
+const WEB_SESSION_TTL_MS=7*24*60*60*1000;
+const webSsoTickets=new Map();
+function cookieValue(req,name){
+  const raw=String(req.headers.cookie||"");
+  for(const part of raw.split(";")){
+    const at=part.indexOf("=");
+    if(at<0)continue;
+    if(part.slice(0,at).trim()===name)return decodeURIComponent(part.slice(at+1).trim());
+  }
+  return "";
+}
+function webCookie(value,maxAgeSeconds=Math.floor(WEB_SESSION_TTL_MS/1000)){
+  return `${WEB_SESSION_COOKIE}=${encodeURIComponent(value)}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=${maxAgeSeconds}`;
+}
+function pruneWebSsoTickets(){
+  const time=Date.now();
+  for(const [ticket,item] of webSsoTickets)if(!item||item.expiresAt<=time)webSsoTickets.delete(ticket);
+}
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildPresences, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
@@ -111,7 +132,7 @@ function userNotificationPreferences(db,userId){
 
 function protect(req, res, next){
   const bearer=String(req.headers.authorization||"").replace(/^Bearer\s+/i,"");
-  const verified=verifyAuthToken(bearer);
+  const verified=verifyAuthToken(bearer)||verifyAuthToken(cookieValue(req,WEB_SESSION_COOKIE));
   if(verified){req.user={...req.user,...verified};return next();}
   if(API_SECRET && req.headers["x-api-secret"]===API_SECRET)return next();
 
@@ -651,6 +672,42 @@ async function markAnnouncementRead(req,res){
 }
 app.post("/api/launcher/announcements/:id/read",protect,requireForbesMembership,markAnnouncementRead);
 app.patch("/api/launcher/announcements/:id/read",protect,requireForbesMembership,markAnnouncementRead);
+
+// One-time Launcher -> Website SSO. The persistent Launcher token is accepted
+// only in the Authorization header and is never placed in a URL.
+app.post("/api/launcher/web-session",protect,requireLauncherSession,requireForbesMembership,(req,res)=>{
+  pruneWebSsoTickets();
+  const ticket=crypto.randomBytes(32).toString("base64url");
+  const returnPath=String(req.body?.returnPath||"/");
+  const safeReturnPath=returnPath.startsWith("/")&&!returnPath.startsWith("//")?returnPath:"/";
+  webSsoTickets.set(ticket,{user:{...req.user,guest:false},returnPath:safeReturnPath,expiresAt:Date.now()+WEB_SSO_TTL_MS});
+  res.json({ok:true,ticket,expiresIn:Math.floor(WEB_SSO_TTL_MS/1000),exchangeUrl:`${String(process.env.PUBLIC_API_URL||"https://forbes-bot.onrender.com").replace(/\/$/,"")}/auth/launcher?ticket=${encodeURIComponent(ticket)}`});
+});
+
+app.get("/auth/launcher",async(req,res)=>{
+  pruneWebSsoTickets();
+  const ticket=String(req.query.ticket||"");
+  const item=webSsoTickets.get(ticket);
+  if(!item||item.expiresAt<=Date.now())return res.redirect(`${NETLIFY_SITE_URL}/?launcher_sso=expired`);
+  webSsoTickets.delete(ticket); // invalidate before any asynchronous work
+  const membership=await checkForbesMembership(item.user.id,{fresh:true});
+  if(!membership.allowed)return res.redirect(`${NETLIFY_SITE_URL}/?launcher_sso=denied`);
+  const session=signAuthPayload({...item.user,iat:Date.now(),kind:"web_session"});
+  res.setHeader("Set-Cookie",webCookie(session));
+  const target=new URL(item.returnPath,NETLIFY_SITE_URL);
+  target.searchParams.set("launcher","1");
+  return res.redirect(target.toString());
+});
+
+app.get("/api/auth/session",protect,requireLauncherSession,(req,res)=>{
+  const {id,name,username,avatar,roles,highestRole,highestRoleName}=req.user||{};
+  res.json({ok:true,authenticated:true,user:{id,name,username,avatar,roles:roles||[],highestRole:highestRole||null,highestRoleName:highestRoleName||highestRole?.name||"FORBES Member"}});
+});
+
+app.post("/api/auth/logout",(req,res)=>{
+  res.setHeader("Set-Cookie",webCookie("",0));
+  res.json({ok:true});
+});
 
 // Discord OAuth login
 app.get("/auth/discord", (req, res) => {

@@ -4154,6 +4154,75 @@ async function sendForbesCalendarCopy(title, description){
 
 app.post("/api/announcements", protect, async (req,res)=>{
   try{
+    const member=await apiMemberFromRequest(req);
+    const category=String(req.body.category||req.body.type||"all").trim().toLowerCase();
+    if(!["all","farm","capt"].includes(category)) return res.status(400).json({ok:false,error:"bad_category"});
+    if(!(forbes2026Farm(member,req)||forbes2026Capt(member,req))) return res.status(403).json({ok:false,error:"no_permission"});
+
+    const categories={
+      all:{title:"👥 Повідомлення для всіх",label:"Для всіх",channelId:CONFIG.channels.generalChat,targetType:"ALL",roleIds:[]},
+      farm:{title:"🌾 Повідомлення для фарму",label:"Фарм",channelId:CONFIG.channels.seniorFarmMessages,targetType:"ROLES",roleIds:[CONFIG.roles.farmer,CONFIG.roles.farmManager].map(String).filter(Boolean)},
+      capt:{title:"⚔️ Повідомлення для капту",label:"Капт",channelId:CONFIG.channels.seniorCaptMessages,targetType:"ROLES",roleIds:[CONFIG.roles.capt,CONFIG.roles.seniorCapt].map(String).filter(Boolean)}
+    };
+    const selected=categories[category];
+    const text=String(req.body.text||req.body.message||"").trim();
+    if(!text) return res.status(400).json({ok:false,error:"empty_text"});
+    const author=member?.displayName||member?.user?.globalName||member?.user?.username||req.user?.global_name||req.user?.username||"FORBES";
+    const item={
+      id:id("ann"),type:"senior_message",category,categoryLabel:selected.label,title:selected.title,
+      text,message:text,targetType:selected.targetType,targetRoleIds:selected.roleIds,priority:"normal",
+      delivery:{discord:true,launcher:true,windows:true},createdAt:new Date().toISOString(),
+      createdBy:String(req.user?.id||member?.id||""),author,authorName:author
+    };
+    const db=readDb();
+    db.announcements=Array.isArray(db.announcements)?db.announcements:[];
+    db.announcements.unshift(item);
+    writeDb(db);
+
+    let discordSent=false,discordError="";
+    try{
+      const destination=await channel(selected.channelId);
+      if(!destination) discordError=`Discord channel not found: ${selected.channelId}`;
+      else{
+        const mention=item.targetType==="ALL"?"@everyone":item.targetRoleIds.map(roleId=>`<@&${roleId}>`).join(" ");
+        await destination.send({
+          content:mention,
+          embeds:[embed(item.title,`${item.text}\n\n**Відправив:** ${author}`)],
+          allowedMentions:item.targetType==="ALL"?{parse:["everyone"]}:{roles:item.targetRoleIds}
+        });
+        discordSent=true;
+      }
+    }catch(error){
+      discordError=error?.message||String(error);
+      console.error("Senior message Discord send failed:",error);
+    }
+    res.json({ok:true,item,announcement:item,discordSent,discordError,discordChannelId:selected.channelId,launcherQueued:true,windowsQueued:true});
+  }catch(error){
+    console.error("POST /api/announcements failed:",error);
+    res.status(500).json({ok:false,error:"announcement_create_failed",message:error?.message||String(error)});
+  }
+});
+
+app.get("/api/announcements", protect, async (req,res)=>{
+  try{
+    const db=readDb();
+    const announcements=Array.isArray(db.announcements)?db.announcements:[];
+    const member=await apiMemberFromRequest(req);
+    const roleIds=member?.roles?.cache?[...member.roles.cache.keys()].map(String):[];
+    const canViewAll=forbes2026Farm(member,req)||forbes2026Capt(member,req);
+    const visible=canViewAll?announcements:announcements.filter(item=>{
+      if(String(item.targetType||"ALL").toUpperCase()==="ALL") return true;
+      const targets=Array.isArray(item.targetRoleIds)?item.targetRoleIds.map(String):[];
+      return targets.some(roleId=>roleIds.includes(roleId));
+    });
+    res.json({ok:true,announcements:visible,count:visible.length});
+  }catch(error){
+    res.status(500).json({ok:false,error:"announcements_get_failed",message:error?.message||String(error)});
+  }
+});
+
+app.post("/api/announcements-legacy", protect, async (req,res)=>{
+  try{
     const annMember=await apiMemberFromRequest(req);
     const annType=String(req.body.type||"all").toLowerCase();
     const canGeneral=_mainId(req)||userHasAnyRole(annMember,[CONFIG.roles.deputy,CONFIG.roles.rightHand]);
@@ -4214,7 +4283,7 @@ app.post("/api/announcements", protect, async (req,res)=>{
   }
 });
 
-app.get("/api/announcements", protect, async (req,res)=>{
+app.get("/api/announcements-legacy", protect, async (req,res)=>{
   try{
     const db=readDb();
     const announcements = Array.isArray(db.announcements) ? db.announcements : [];

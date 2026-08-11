@@ -63,6 +63,8 @@ export const CONFIG = {
     giveawayWinners: "1505075996100137110",
     birthdays: "1533936489262747699",
     generalChat: "1504875096484085984",
+    seniorFarmMessages: "1504857319907790898",
+    seniorCaptMessages: "1504874640705585192",
     chargeReports: "1533952822775779419"
   },
 

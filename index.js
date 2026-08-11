@@ -4221,6 +4221,23 @@ app.get("/api/announcements", protect, async (req,res)=>{
   }
 });
 
+app.delete("/api/announcements/:id", protect, async (req,res)=>{
+  try{
+    const member=await apiMemberFromRequest(req);
+    if(!(forbes2026Farm(member,req)||forbes2026Capt(member,req))) return res.status(403).json({ok:false,error:"no_permission"});
+    const announcementId=String(req.params.id||"").trim();
+    const db=readDb();
+    db.announcements=Array.isArray(db.announcements)?db.announcements:[];
+    const before=db.announcements.length;
+    db.announcements=db.announcements.filter(item=>String(item.id||"")!==announcementId);
+    if(db.announcements.length===before) return res.status(404).json({ok:false,error:"announcement_not_found"});
+    writeDb(db);
+    res.json({ok:true,id:announcementId,removed:true});
+  }catch(error){
+    res.status(500).json({ok:false,error:"announcement_delete_failed",message:error?.message||String(error)});
+  }
+});
+
 app.post("/api/announcements-legacy", protect, async (req,res)=>{
   try{
     const annMember=await apiMemberFromRequest(req);

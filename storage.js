@@ -79,6 +79,29 @@ function normalizeDb(data){
   return stripHeavyData({...DEFAULT_DB, ...(data || {})});
 }
 
+function memberRows(db){
+  return (Array.isArray(db?.members)?db.members:[]).map(member=>({
+    member_id:String(member.memberId||member.member_id||member.id||""),
+    game_nickname:String(member.gameNickname||member.game_nickname||member.nickname||member.nick||""),
+    game_id:String(member.gameId||member.game_id||member.staticId||member.playerId||"")||null,
+    discord_user_id:String(member.discordUserId||member.discord_user_id||member.discordId||member.userId||"")||null,
+    active:member.active!==false,
+    created_at:member.createdAt||member.created_at||new Date().toISOString(),
+    updated_at:new Date().toISOString()
+  })).filter(row=>row.member_id);
+}
+function memberFromRow(row){
+  return {memberId:String(row.member_id),gameNickname:String(row.game_nickname||""),gameId:String(row.game_id||""),discordUserId:String(row.discord_user_id||""),active:row.active!==false,createdAt:row.created_at||new Date().toISOString(),updatedAt:row.updated_at||new Date().toISOString()};
+}
+async function syncMemberRows(db){
+  if(!supabase)return {ok:true,mode:"local"};
+  const rows=memberRows(db);
+  if(!rows.length)return {ok:true,mode:"supabase",members:0};
+  const {error}=await supabase.from("forbes_members").upsert(rows,{onConflict:"member_id"});
+  if(error)throw error;
+  return {ok:true,mode:"supabase",members:rows.length};
+}
+
 function localRead(){
   try {
     if(!fs.existsSync(DB_FILE)) {
@@ -104,6 +127,22 @@ function localWrite(data){
 // readDb/writeDb лишаються синхронними, щоб не ламати старий код.
 // Якщо Supabase увімкнений, база підтягується в локальний кеш при старті і кожен writeDb пише в Supabase у фоні.
 let memoryDb = localRead();
+let supabaseWriteQueue=Promise.resolve();
+
+function queueSupabaseWrite(data){
+  if(!supabase)return Promise.resolve({ok:true,mode:"local"});
+  const snapshot=normalizeDb(JSON.parse(JSON.stringify(data)));
+  const operation=supabaseWriteQueue.then(async()=>{
+    const {error}=await supabase
+      .from("forbes_db")
+      .upsert({id:SUPABASE_DB_KEY,data:snapshot,updated_at:new Date().toISOString()});
+    if(error)throw error;
+    await syncMemberRows(snapshot);
+    return {ok:true,mode:"supabase"};
+  });
+  supabaseWriteQueue=operation.catch(()=>{});
+  return operation;
+}
 
 export async function initDb(){
   if(!supabase){
@@ -131,6 +170,9 @@ export async function initDb(){
       if(upsertError) throw upsertError;
       console.log("✅ Supabase DB created.");
     }
+    const {data:memberData,error:memberError}=await supabase.from("forbes_members").select("member_id,game_nickname,game_id,discord_user_id,active,created_at,updated_at");
+    if(memberError)console.warn("⚠️ forbes_members table unavailable; compatibility registry remains active:",memberError.message||memberError);
+    else if(Array.isArray(memberData)&&memberData.length){const existing=Array.isArray(memoryDb.members)?memoryDb.members:[];memoryDb.members=memberData.map(row=>{const core=memberFromRow(row);const old=existing.find(x=>String(x.memberId||x.member_id||x.id||"")===core.memberId||String(x.discordUserId||x.discord_user_id||"")===core.discordUserId);return {...(old||{}),...core};});localWrite(memoryDb);}
   } catch(e) {
     console.error("⚠️ Supabase init failed, using local db.json:", e?.message || e);
   }
@@ -147,13 +189,7 @@ export function writeDb(data){
   localWrite(memoryDb);
 
   if(supabase){
-    supabase
-      .from("forbes_db")
-      .upsert({ id: SUPABASE_DB_KEY, data: memoryDb, updated_at: new Date().toISOString() })
-      .then(({ error }) => {
-        if(error) console.error("⚠️ Supabase write failed:", error.message || error);
-      })
-      .catch(e => console.error("⚠️ Supabase write failed:", e?.message || e));
+    queueSupabaseWrite(memoryDb).catch(e=>console.error("⚠️ Supabase write failed:",e?.message||e));
   }
 }
 
@@ -165,11 +201,7 @@ export async function writeDbAsync(data){
   if(!supabase) return {ok:true,mode:"local"};
 
   try{
-    const { error } = await supabase
-      .from("forbes_db")
-      .upsert({ id: SUPABASE_DB_KEY, data: memoryDb, updated_at: new Date().toISOString() });
-    if(error) throw error;
-    return {ok:true,mode:"supabase"};
+    return await queueSupabaseWrite(memoryDb);
   }catch(e){
     console.error("⚠️ Supabase awaited write failed:", e?.message || e);
     return {ok:false,mode:"supabase",error:e?.message || String(e)};

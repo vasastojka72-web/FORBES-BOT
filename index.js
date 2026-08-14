@@ -80,17 +80,21 @@ function nextSimpleId(db, prefix, collections = []){
 
 function addUserNotification(db, notification = {}){
   const discordUserId = String(notification.recipientDiscordUserId || notification.discordUserId || "").trim();
-  if(!discordUserId) return null;
+  const central=findCentralMember(db,{memberId:notification.recipientMemberId||notification.memberId,discordUserId});
+  const recipientMemberId=String(central?.memberId||notification.recipientMemberId||notification.memberId||"");
+  const resolvedDiscordUserId=String(central?.discordUserId||discordUserId);
+  if(!resolvedDiscordUserId&&!recipientMemberId) return null;
   db.notifications = Array.isArray(db.notifications) ? db.notifications : [];
   const type = String(notification.type || "system");
   const entityId = String(notification.sourceEntityId || notification.entityId || "");
-  const idempotencyKey = String(notification.idempotencyKey || `${discordUserId}:${type}:${entityId}`);
-  const existing = db.notifications.find(item => String(item.idempotencyKey || `${item.discordUserId}:${item.type}:${item.entityId}`) === idempotencyKey);
+  const idempotencyKey = String(notification.idempotencyKey || `${recipientMemberId||resolvedDiscordUserId}:${type}:${entityId}`);
+  const existing = db.notifications.find(item => String(item.idempotencyKey || `${item.recipientMemberId||item.discordUserId}:${item.type}:${item.entityId}`) === idempotencyKey || (String(item.type)===type&&String(item.entityId)===entityId&&((recipientMemberId&&String(item.recipientMemberId||"")===recipientMemberId)||(resolvedDiscordUserId&&String(item.discordUserId||"")===resolvedDiscordUserId))));
   if(existing) return existing;
   const item = {
     id: id("notification"),
-    discordUserId,
-    recipientDiscordUserId: discordUserId,
+    recipientMemberId,
+    discordUserId:resolvedDiscordUserId,
+    recipientDiscordUserId:resolvedDiscordUserId,
     type,
     title: String(notification.title || "FORBES Launcher"),
     message: String(notification.message || ""),
@@ -105,6 +109,90 @@ function addUserNotification(db, notification = {}){
   db.notifications.unshift(item);
   db.notifications = db.notifications.slice(0, 2000);
   return item;
+}
+
+function normalizeDiscordUserId(value){
+  const id=String(value||"").replace(/\D/g,"");
+  return /^\d{15,25}$/.test(id)?id:"";
+}
+function normalizeGameId(value){
+  const id=String(value||"").trim().replace(/^ID\s*/i,"");
+  return /^\d{1,10}$/.test(id)?id:"";
+}
+function normalizeMemberNickname(value){
+  return String(value||"").trim().replace(/\s+/g," ");
+}
+function ensureCentralMembers(db){
+  db.members=Array.isArray(db.members)?db.members:[];
+  return db.members;
+}
+function findCentralMember(db,ref={}){
+  const members=ensureCentralMembers(db);
+  const memberId=String(ref.memberId||ref.member_id||ref.targetMemberId||ref.target_member_id||"").trim();
+  const discordUserId=normalizeDiscordUserId(ref.discordUserId||ref.discord_user_id||ref.discordId||ref.userId);
+  const gameId=normalizeGameId(ref.gameId||ref.game_id||ref.staticId||ref.playerId);
+  const nickname=normalizeMemberNickname(ref.gameNickname||ref.game_nickname||ref.nickname||ref.nick||ref.player||ref.name).toLowerCase();
+  if(memberId){const found=members.find(x=>String(x.memberId||x.member_id||x.id)===memberId);if(found)return found;}
+  if(discordUserId){const found=members.find(x=>normalizeDiscordUserId(x.discordUserId||x.discord_user_id||x.discordId||x.userId)===discordUserId);if(found)return found;}
+  if(gameId){const found=members.find(x=>normalizeGameId(x.gameId||x.game_id||x.staticId||x.playerId)===gameId);if(found)return found;}
+  if(nickname)return members.find(x=>normalizeMemberNickname(x.gameNickname||x.game_nickname||x.nickname||x.nick).toLowerCase()===nickname)||null;
+  return null;
+}
+function upsertCentralMember(db,input={}){
+  const members=ensureCentralMembers(db);
+  const discordUserId=normalizeDiscordUserId(input.discordUserId||input.discord_user_id||input.discordId||input.userId);
+  const gameId=normalizeGameId(input.gameId||input.game_id||input.staticId||input.playerId);
+  const gameNickname=normalizeMemberNickname(input.gameNickname||input.game_nickname||input.nickname||input.nick||input.username);
+  const requestedMemberId=String(input.memberId||input.member_id||"").trim();
+  const explicitMember=requestedMemberId?findCentralMember(db,{memberId:requestedMemberId}):null;
+  const discordMember=discordUserId?findCentralMember(db,{discordUserId}):null;
+  const gameMember=gameId?findCentralMember(db,{gameId}):null;
+  let member=explicitMember||discordMember||(!discordUserId||!gameMember?.discordUserId?gameMember:null);
+  if(!member){
+    member={memberId:`member_${crypto.randomUUID()}`,createdAt:new Date().toISOString()};
+    members.push(member);
+  }
+  const discordOwner=discordUserId?members.find(x=>x!==member&&normalizeDiscordUserId(x.discordUserId||x.discord_user_id)===discordUserId):null;
+  const gameOwner=gameId?members.find(x=>x!==member&&normalizeGameId(x.gameId||x.game_id)===gameId):null;
+  if(discordUserId&&!discordOwner)member.discordUserId=discordUserId;
+  if(gameId&&!gameOwner)member.gameId=gameId;
+  if(gameNickname)member.gameNickname=gameNickname;
+  if(Array.isArray(input.roles))member.roles=input.roles;
+  if(input.avatar)member.avatar=String(input.avatar);
+  if(input.role)member.role=String(input.role);
+  if(input.highestRole)member.highestRole=input.highestRole;
+  if(input.highestRoleName)member.highestRoleName=String(input.highestRoleName);
+  if(input.status)member.status=String(input.status);
+  if(input.presence)member.presence=String(input.presence);
+  if(typeof input.online==="boolean")member.online=input.online;
+  if(typeof input.isOnline==="boolean")member.isOnline=input.isOnline;
+  member.updatedAt=new Date().toISOString();
+  member.active=input.active!==false;
+  return member;
+}
+function publicCentralMember(member={}){
+  return {memberId:String(member.memberId||member.member_id||member.id||""),nick:String(member.gameNickname||member.game_nickname||member.nickname||member.nick||""),nickname:String(member.gameNickname||member.game_nickname||member.nickname||member.nick||""),staticId:String(member.gameId||member.game_id||member.staticId||member.playerId||""),playerId:String(member.gameId||member.game_id||member.staticId||member.playerId||""),avatar:String(member.avatar||""),role:String(member.role||member.highestRoleName||"Учасник"),highestRole:member.highestRole||null,highestRoleName:String(member.highestRoleName||member.role||"Учасник"),roles:Array.isArray(member.roles)?member.roles:[],status:String(member.status||member.presence||"offline"),presence:String(member.presence||member.status||"offline"),online:Boolean(member.online||member.isOnline),isOnline:Boolean(member.online||member.isOnline)};
+}
+function backfillCentralMemberRelations(db){
+  let changed=false;
+  const attach=(record,key="targetMemberId")=>{
+    if(!record||typeof record!=="object")return;
+    let member=findCentralMember(db,record);
+    const discordUserId=normalizeDiscordUserId(record.discordUserId||record.recipientDiscordUserId||record.userId);
+    if(!member&&discordUserId)member=upsertCentralMember(db,record);
+    if(member&&!record[key]){record[key]=member.memberId;changed=true;}
+    if(member&&!record.discordUserId){record.discordUserId=member.discordUserId;changed=true;}
+  };
+  for(const record of (db.fines||[]))attach(record);
+  for(const record of (db.warnings||[]))attach(record);
+  for(const record of (db.warningPayments||[]))attach(record);
+  for(const report of (db.farmReports||[])){
+    attach(report,"memberId");
+    for(const player of (report.players||[]))attach(player,"memberId");
+  }
+  for(const capt of (db.capts||[]))for(const participant of (capt.participants||[]))attach(participant,"memberId");
+  for(const notification of (db.notifications||[]))attach(notification,"recipientMemberId");
+  return changed;
 }
 
 const DEFAULT_NOTIFICATION_PREFERENCES = Object.freeze({
@@ -480,31 +568,33 @@ app.get("/api/launcher/notifications", protect, requireForbesMembership, async (
   const limit = Math.min(Math.max(Number(req.query.limit || 50), 1), 100);
   const since = String(req.query.since || "");
   const db = readDb();
+  const currentMember=findCentralMember(db,{discordUserId});
+  const belongsToCurrent=item=>String(item?.recipientMemberId||item?.memberId||item?.targetMemberId||"")===String(currentMember?.memberId||" ")||String(item?.discordUserId||item?.userId||"")===discordUserId;
   const beforeMaterialize = Array.isArray(db.notifications) ? db.notifications.length : 0;
   // Rebuild personal events from the canonical records as a safety net. This
   // also repairs older records created before notification delivery existed.
   for(const fine of (Array.isArray(db.fines) ? db.fines : [])){
-    if(String(fine.discordUserId||"")===discordUserId && !String(fine.id||"").startsWith("finepay_"))
+    if(belongsToCurrent(fine) && !String(fine.id||"").startsWith("finepay_"))
       addUserNotification(db,{discordUserId,type:"fine_created",title:"Новий штраф",message:`${fine.reason||"Без причини"}. Сума: ${money(fine.amount||0)}.`,entityType:"fine",entityId:fine.id});
   }
   for(const warning of (Array.isArray(db.warnings) ? db.warnings : [])){
-    if(String(warning.discordUserId||"")===discordUserId)
+    if(belongsToCurrent(warning))
       addUserNotification(db,{discordUserId,type:"warning_created",title:"Нова догана",message:warning.reason||"Причину не вказано.",entityType:"warning",entityId:warning.id});
   }
   for(const report of (Array.isArray(db.farmReports) ? db.farmReports : [])){
     const status=String(report.status||"");
     if(status!=="approved"&&status!=="rejected") continue;
-    const isAuthor=String(report.discordUserId||"")===discordUserId;
-    const isParticipant=(Array.isArray(report.players)?report.players:[]).some(p=>String(p?.discordUserId||p?.userId||"")===discordUserId);
+    const isAuthor=belongsToCurrent(report);
+    const isParticipant=(Array.isArray(report.players)?report.players:[]).some(belongsToCurrent);
     if(isAuthor||isParticipant) addUserNotification(db,{discordUserId,type:status==="approved"?"farm_report_approved":"farm_report_rejected",title:isParticipant&&!isAuthor?(status==="approved"?"Фарм-звіт з вашою участю прийнято":"Фарм-звіт з вашою участю відхилено"):(status==="approved"?"Звіт схвалено":"Звіт відхилено"),message:`Фарм-звіт ${report.id} ${status==="approved"?"прийнято":"відхилено"}.`,entityType:"farm_report",entityId:report.id});
   }
   for(const capt of (Array.isArray(db.capts) ? db.capts : [])){
-    const registered=(Array.isArray(capt.participants)?capt.participants:[]).some(p=>String(p?.discordUserId||p?.userId||p)===discordUserId);
+    const registered=(Array.isArray(capt.participants)?capt.participants:[]).some(belongsToCurrent);
     if(registered) addUserNotification(db,{discordUserId,type:"capt_registered",title:"Ви записані на капт",message:`${capt.date||"Дата не вказана"} о ${capt.time||"--:--"}. Проти: ${capt.enemy||"не вказано"}.`,entityType:"capt",entityId:capt.id});
   }
   if((db.notifications||[]).length!==beforeMaterialize) await writeDbAsync(db);
   let notifications = (Array.isArray(db.notifications) ? db.notifications : [])
-    .filter(item => String(item.discordUserId) === discordUserId);
+    .filter(belongsToCurrent);
   /* Personal notifications and announcements are intentionally separate feeds.
      Keep this legacy mapper disabled so announcement unread state cannot pollute
      the personal badge. */
@@ -625,8 +715,9 @@ app.post("/api/launcher/notifications/:id/read", protect, requireForbesMembershi
   const discordUserId = String(req.user?.id || "");
   if(!discordUserId || req.user?.guest) return res.status(401).json({ok:false,error:"auth_required"});
   const db = readDb();
+  const currentMember=findCentralMember(db,{discordUserId});
   const item = (Array.isArray(db.notifications) ? db.notifications : [])
-    .find(entry => String(entry.id) === String(req.params.id) && String(entry.discordUserId) === discordUserId);
+    .find(entry => String(entry.id) === String(req.params.id) && (String(entry.recipientMemberId||"")===String(currentMember?.memberId||" ")||String(entry.discordUserId)===discordUserId));
   if(!item) return res.status(404).json({ok:false,error:"notification_not_found"});
   item.readAt = item.readAt || new Date().toISOString();
   await writeDbAsync(db);
@@ -639,16 +730,18 @@ app.get("/api/launcher/capts/me/upcoming",protect,requireForbesMembership,(req,r
   const userId=String(req.user?.id||"");
   if(!userId||req.user?.guest)return res.status(401).json({ok:false,error:"auth_required"});
   const db=readDb(), nowMs=Date.now();
+  const currentMember=findCentralMember(db,{discordUserId:userId});
+  const isCurrent=p=>String(p?.memberId||p?.member_id||"")===String(currentMember?.memberId||" ")||String(p?.discordUserId||p?.userId||p||"")===userId;
   const capts=(Array.isArray(db.capts)?db.capts:[])
     .filter(c=>String(c.status||"").toLowerCase()!=="closed")
     .filter(c=>Array.isArray(c.participants)
-      ? c.participants.some(p=>String(p.discordUserId||p.userId||p)===userId&&String(p.status||"registered")==="registered")
+      ? c.participants.some(p=>isCurrent(p)&&String(p.status||"registered")==="registered")
       : (c.yes||[]).map(String).includes(userId))
     .map(c=>({capt:c,start:parseCaptDateTime(c)}))
     .filter(x=>x.start&&x.start.getTime()>nowMs)
     .sort((a,b)=>a.start-b.start)
     .map(({capt,start})=>{
-      const participant=(capt.participants||[]).find(p=>String(p.discordUserId||p.userId||p)===userId);
+      const participant=(capt.participants||[]).find(isCurrent);
       return {id:String(capt.id||""),captId:String(capt.id||""),date:String(capt.date||""),time:String(capt.time||""),enemy:String(capt.enemy||""),startsAt:start.toISOString(),startsAtUnixMs:start.getTime(),registered:true,status:"registered",registeredAt:participant?.registeredAt||capt.createdAt||""};
     });
   res.json({ok:true,capts,serverTime:new Date().toISOString()});
@@ -658,7 +751,8 @@ app.patch("/api/launcher/notifications/:id/read", protect, requireForbesMembersh
   const userId=String(req.user?.id||"");
   if(!userId||req.user?.guest)return res.status(401).json({ok:false,error:"auth_required"});
   const db=readDb();
-  const item=(db.notifications||[]).find(x=>String(x.id)===String(req.params.id)&&String(x.discordUserId)===userId);
+  const currentMember=findCentralMember(db,{discordUserId:userId});
+  const item=(db.notifications||[]).find(x=>String(x.id)===String(req.params.id)&&(String(x.recipientMemberId||"")===String(currentMember?.memberId||" ")||String(x.discordUserId)===userId));
   if(!item)return res.status(404).json({ok:false,error:"notification_not_found"});
   item.readAt=item.readAt||new Date().toISOString();
   await writeDbAsync(db);
@@ -801,7 +895,13 @@ app.get("/auth/discord/callback", async (req, res) => {
     }
 
     const highestRole = roles[0] || null;
-    const userPayload={id:user.id,name:serverNick,username:user.username,globalName:user.global_name,avatar:user.avatar,roles,highestRole,highestRoleName:highestRole?.name||"Учасник"};
+    const parsedMember=parseForbesStaticNickFinal(serverNick);
+    const memberDb=readDb();
+    const centralMember=upsertCentralMember(memberDb,{discordUserId:user.id,nickname:parsedMember.nick||serverNick,staticId:parsedMember.staticId,roles});
+    centralMember.roles=roles;
+    backfillCentralMemberRelations(memberDb);
+    await writeDbAsync(memberDb);
+    const userPayload={id:user.id,memberId:centralMember.memberId,name:serverNick,username:user.username,globalName:user.global_name,avatar:user.avatar,roles,highestRole,highestRoleName:highestRole?.name||"Учасник"};
     const payload=Buffer.from(JSON.stringify(userPayload)).toString("base64url");
     const discordToken=signAuthPayload({...userPayload,iat:Date.now()});
     if (launcherClient) {
@@ -921,6 +1021,7 @@ async function getPublicMembersFromDiscord(){
           nick: parsed.nick,
           nickname: parsed.nick,
           username: m.user?.username || parsed.nick,
+          discordUserId: m.id,
           discordId: m.id,
           staticId: parsed.staticId,
           playerId: parsed.staticId,
@@ -1200,9 +1301,10 @@ app.post("/api/birthdays", protect, async (req,res)=>{
     if(!staticId) return res.status(400).json({ok:false,error:"static_id_required",message:"Вкажи Static ID."});
     if(!Number.isInteger(day)||day<1||day>31||!Number.isInteger(month)||month<1||month>12) return res.status(400).json({ok:false,error:"invalid_birthday",message:"Вкажи правильний день і місяць."});
     const db=readDb(); db.birthdays=Array.isArray(db.birthdays)?db.birthdays:[];
-    const discordId=String(req.user?.id||req.body.discordUserId||"");
+    const discordId=String(req.user?.id||"");
+    const centralMember=upsertCentralMember(db,{discordUserId:discordId,nickname,gameId:staticId});
     const existing=db.birthdays.find(x=>discordId&&String(x.discordUserId||"")===discordId)||db.birthdays.find(x=>String(x.staticId||"")===staticId);
-    const birthday={id:existing?.id||id("birthday"),nickname,staticId,discordUserId:discordId,discordName:req.body.discordName||req.body.discord||"",day,month,enabled:true,createdAt:existing?.createdAt||now(),updatedAt:now()};
+    const birthday={id:existing?.id||id("birthday"),memberId:centralMember.memberId,nickname,staticId,discordUserId:discordId,discordName:req.user?.name||req.user?.username||"",day,month,enabled:true,createdAt:existing?.createdAt||now(),updatedAt:now()};
     if(existing)Object.assign(existing,birthday);else db.birthdays.unshift(birthday);
     const wr=typeof writeDbAsync==="function"?await writeDbAsync(db):(writeDb(db),{ok:true});
     if(!wr.ok)return res.status(500).json({ok:false,error:"birthday_db_write_failed",message:wr.error||"Не вдалося зберегти."});
@@ -1220,14 +1322,16 @@ app.post("/api/applications", protect, async (req,res)=>{
     const db=readDb();
     db.applications = Array.isArray(db.applications) ? db.applications : [];
 
+    const centralMember=upsertCentralMember(db,{discordUserId:req.user?.id,nickname:req.body.nickname||req.body.nick,gameId:req.body.staticId||req.body.playerId});
     const item={
       id:id("app"),
+      memberId:centralMember.memberId,
       type:req.body.type||"family",
       nickname:req.body.nickname||req.body.nick||"",
       staticId:req.body.staticId||req.body.playerId||"",
-      discord:req.body.discord||"",
-      discordUserId:req.user?.id||req.body.discordUserId||"",
-      discordName:req.body.discordName||"",
+      discord:req.user?.name||req.user?.username||"",
+      discordUserId:req.user?.id||"",
+      discordName:req.user?.name||req.user?.username||"",
       age:req.body.age||"",
       level:req.body.level||"",
       serverExperience:req.body.serverExperience||"",
@@ -1256,10 +1360,10 @@ app.post("/api/applications", protect, async (req,res)=>{
         return res.status(400).json({ok:false,error:"invalid_birthday",message:"Вкажіть правильний день і місяць."});
       }
       db.birthdays=Array.isArray(db.birthdays)?db.birthdays:[];
-      const discordId=String(req.user?.id||item.discordUserId||"");
+      const discordId=String(req.user?.id||"");
       const existing=db.birthdays.find(x=>discordId&&String(x.discordUserId||"")===discordId) || db.birthdays.find(x=>String(x.staticId||"")===String(item.staticId||""));
       const birthday={
-        id:existing?.id||id("birthday"), nickname:item.nickname, staticId:item.staticId, discordUserId:discordId,
+        id:existing?.id||id("birthday"), memberId:centralMember.memberId, nickname:item.nickname, staticId:item.staticId, discordUserId:discordId,
         discordName:item.discordName||item.discord, day, month, enabled:true,
         createdAt:existing?.createdAt||now(), updatedAt:now()
       };
@@ -1441,23 +1545,29 @@ if(!memberHasRealServerRole(member)){
     if(screenshotFile.tooLarge){
       return publicError(res,400,"screenshot_too_large",`Скріншот завеликий (${screenshotFile.sizeMb}MB). Максимум ${screenshotFile.maxMb}MB.`);
     }
+    const db = readDb();
     const submittedPlayers = Array.isArray(req.body.players) ? req.body.players : [];
     const players = [];
     for(const player of submittedPlayers){
-      const resolved = await findDiscordMemberForRecord(player || {});
+      let central=findCentralMember(db,player||{});
+      const resolved = await findDiscordMemberForRecord(central||player||{});
+      if(!central&&resolved)central=upsertCentralMember(db,{...player,discordUserId:resolved.id,nickname:resolved.displayName});
       players.push({
         ...player,
+        memberId:central?.memberId||player?.memberId||"",
         staticId:player?.staticId || player?.playerId || player?.id || "",
-        discordUserId:resolved?.id || player?.discordUserId || player?.discordId || player?.userId || ""
+        discordUserId:central?.discordUserId||resolved?.id || player?.discordUserId || player?.discordId || player?.userId || ""
       });
     }
     const amount = Number(req.body.amount || req.body.contractAmount || 0);
     const each = Number(req.body.each || (players.length ? Math.floor(amount * 0.8 / players.length) : 0));
     const familyShare = Number(req.body.familyShare || Math.floor(amount * 0.2));
 
+    const authorCentral=upsertCentralMember(db,{discordUserId:req.user?.id||member.id,nickname:member.displayName||req.user?.username||"",staticId:req.body.staticId||req.body.id||""});
     const item = {
       id:id("farm"),
-      discordUserId:req.user?.id || req.body.discordUserId || req.headers["x-discord-user-id"] || "",
+      memberId:authorCentral.memberId,
+      discordUserId:authorCentral.discordUserId,
       player:req.body.player || req.body.nickname || member.displayName || req.user?.username || "",
       staticId:req.body.staticId || req.body.id || "",
       contract:req.body.contract || req.body.contractName || "",
@@ -1475,7 +1585,6 @@ if(!memberHasRealServerRole(member)){
 
     debugLog("farm_report_submit", {by:member.id, reportId:item.id, amount, players:players.length});
 
-    const db = readDb();
     db.farmReports = Array.isArray(db.farmReports) ? db.farmReports : [];
     db.farmReports.unshift(item);
     trimSystemLogs(db);
@@ -1596,21 +1705,42 @@ app.get("/api/capts", protect, async (req,res)=>{
   const db=readDb();
   const guild=await client.guilds.fetch(CONFIG.guildId).catch(()=>null);
   const capts=[];
+  let membersChanged=false;
   for(const capt of (db.capts||[])){
     const participants=Array.isArray(capt.participants)?[...capt.participants]:[];
-    const knownIds=new Set(participants.map(p=>String(p?.discordUserId||p?.userId||p||"")));
-    const legacyIds=[...(capt.yes||[]),...(capt.no||[]),...(capt.maybe||[])].map(String).filter(Boolean);
-    for(const discordUserId of [...new Set(legacyIds)]){
-      if(knownIds.has(discordUserId)) continue;
-      const discordMember=guild?await guild.members.fetch(discordUserId).catch(()=>null):null;
-      participants.push({
-        discordUserId,
-        nickname:discordMember?.displayName||discordMember?.user?.username||"Учасник Discord"
-      });
-      knownIds.add(discordUserId);
+    const legacyRefs=[...(capt.yes||[]),...(capt.no||[]),...(capt.maybe||[]),...(capt.absent||[])].map(String).filter(Boolean);
+    for(const ref of [...new Set(legacyRefs)]){
+      let central=findCentralMember(db,{memberId:ref,discordUserId:ref});
+      const discordUserId=central?.discordUserId||normalizeDiscordUserId(ref);
+      const discordMember=discordUserId&&guild?await guild.members.fetch(discordUserId).catch(()=>null):null;
+      if(!central&&discordUserId){
+        central=upsertCentralMember(db,{discordUserId,nickname:discordMember?.displayName||discordMember?.user?.username||""});
+        membersChanged=true;
+      }
+      if(central&&discordMember){
+        upsertCentralMember(db,{memberId:central.memberId,discordUserId,nickname:discordMember.displayName||discordMember.user?.username||""});
+        membersChanged=true;
+      }
     }
-    capts.push({...capt,participants});
+    for(const participant of participants){
+      const central=findCentralMember(db,participant);
+      if(central&&!participant.memberId){participant.memberId=central.memberId;membersChanged=true;}
+    }
+    const toMemberIds=refs=>[...new Set((refs||[]).map(ref=>findCentralMember(db,{memberId:ref,discordUserId:ref})?.memberId||"").filter(Boolean))];
+    const participantMembers=[...new Set([
+      ...toMemberIds(capt.yes),...toMemberIds(capt.no),...toMemberIds(capt.maybe),
+      ...participants.map(p=>findCentralMember(db,p)?.memberId||"").filter(Boolean)
+    ])].map(memberId=>publicCentralMember(findCentralMember(db,{memberId}))).filter(p=>p.memberId);
+    capts.push({
+      ...capt,
+      yes:toMemberIds(capt.yes),
+      no:toMemberIds(capt.no),
+      maybe:toMemberIds(capt.maybe),
+      absent:toMemberIds(capt.absent),
+      participants:participantMembers
+    });
   }
+  if(membersChanged)await writeDbAsync(db);
   res.json({ok:true,capts});
 });
 
@@ -1676,7 +1806,9 @@ app.post("/api/capts", protect, async (req,res)=>{
       const guildMembers=await member.guild.members.fetch();
       for(const target of guildMembers.values()){
         if(!target.user?.bot&&canUseCaptSignup(target)){
+          const centralTarget=upsertCentralMember(db,{discordUserId:target.id,nickname:target.displayName||target.user?.username||""});
           addUserNotification(db,{
+            recipientMemberId:centralTarget.memberId,
             discordUserId:target.id,
             type:"capt_created",
             title:"Створено запис на капт",
@@ -1768,19 +1900,26 @@ app.post("/api/capts/:id/absent", protect, async (req,res)=>{
     const capt = (db.capts || []).find(x => String(x.id) === String(req.params.id));
     if(!capt) return res.status(404).json({ok:false,error:"capt_not_found"});
 
-    const userId = String(req.body.userId || "").replace(/[<@!>]/g,"").trim();
-    if(!userId) return res.status(400).json({ok:false,error:"user_required"});
-    const yes = (capt.yes || []).map(String);
-    if(!yes.includes(userId)) return res.status(400).json({ok:false,error:"user_not_in_yes_list"});
+    const targetMember=findCentralMember(db,{
+      memberId:req.body.targetMemberId||req.body.memberId,
+      discordUserId:req.body.userId
+    });
+    if(!targetMember?.memberId||!targetMember?.discordUserId)return res.status(400).json({ok:false,error:"member_required"});
+    const targetMemberId=String(targetMember.memberId);
+    const userId=String(targetMember.discordUserId);
+    const yesMemberIds=(capt.yes||[]).map(ref=>findCentralMember(db,{memberId:ref,discordUserId:ref})?.memberId||"").filter(Boolean);
+    if(!yesMemberIds.includes(targetMemberId)) return res.status(400).json({ok:false,error:"user_not_in_yes_list"});
 
     capt.absent = Array.isArray(capt.absent) ? capt.absent : [];
-    if(!capt.absent.map(String).includes(userId)) capt.absent.push(userId);
+    const absentMemberIds=capt.absent.map(ref=>findCentralMember(db,{memberId:ref,discordUserId:ref})?.memberId||"").filter(Boolean);
+    if(!absentMemberIds.includes(targetMemberId)) capt.absent.push(targetMemberId);
 
     db.fines = Array.isArray(db.fines) ? db.fines : [];
     const fine = {
       id:id("fine"),
-      nickname:req.body.nickname || "",
-      staticId:req.body.staticId || "",
+      targetMemberId,
+      nickname:targetMember.gameNickname || req.body.nickname || "",
+      staticId:targetMember.gameId || req.body.staticId || "",
       discordUserId:userId,
       amount:50000,
       reason:`Неявка на капт ${capt.date || ""} ${capt.time || ""}`,
@@ -1927,7 +2066,9 @@ app.post("/api/fines", protect, async (req,res)=>{
 
     const db=readDb();
     db.fines = Array.isArray(db.fines) ? db.fines : [];
-    const targetMember = await findDiscordMemberForRecord(req.body || {});
+    let centralTarget=findCentralMember(db,req.body||{});
+    const targetMember = await findDiscordMemberForRecord(centralTarget||req.body||{});
+    if(!centralTarget&&targetMember)centralTarget=upsertCentralMember(db,{...req.body,discordUserId:targetMember.id,nickname:targetMember.displayName});
     const item={
       id:id("fine"),
       nickname:req.body.nickname||req.body.nick||"",
@@ -1935,7 +2076,8 @@ app.post("/api/fines", protect, async (req,res)=>{
       amount:Number(req.body.amount||0),
       reason:req.body.reason||"",
       screenshotUrl:safeRemoteMediaUrl(req.body.screenshotUrl||req.body.screen),
-      discordUserId:targetMember?.id || req.body.discordUserId || "",
+      targetMemberId:centralTarget?.memberId||"",
+      discordUserId:centralTarget?.discordUserId||targetMember?.id || req.body.discordUserId || "",
       status:"unpaid",
       createdAt:now(),
       createdBy:member.displayName||member.user?.username||req.user?.name||"",
@@ -1990,27 +2132,30 @@ app.post("/api/fine-payments", protect, async (req,res)=>{
   /* FORBES_DISC_ALL_PATCH */
   if(member && !canDisciplineAll(member, req)) return denyPerm(res,"Недостатньо прав для штрафів/доган.");
   const db=readDb();
-  const targetMember=await findDiscordMemberForRecord(req.body||{});
+  const original = (db.fines || []).find(f => f.id === String(req.body.fineId||""));
+  let centralTarget=findCentralMember(db,{memberId:original?.targetMemberId,...req.body});
+  const targetMember=await findDiscordMemberForRecord(centralTarget||original||req.body||{});
+  if(!centralTarget&&targetMember)centralTarget=upsertCentralMember(db,{...(original||req.body),discordUserId:targetMember.id,nickname:targetMember.displayName});
   const item={
     id:nextSimpleId(db,"finepay",["fines","finePayments"]),
     fineId:req.body.fineId||"",
     nickname:req.body.nickname||req.body.nick||"",
     staticId:req.body.staticId||req.body.playerId||"",
     screenshotUrl:safeRemoteMediaUrl(req.body.screenshotUrl),
-    discordUserId:targetMember?.id||req.body.discordUserId||"",
+    targetMemberId:centralTarget?.memberId||original?.targetMemberId||"",
+    discordUserId:centralTarget?.discordUserId||targetMember?.id||original?.discordUserId||req.body.discordUserId||"",
     status:"pending",
     createdAt:now()
   };
 
   db.fines.unshift(item);
 
-  const original = (db.fines || []).find(f => f.id === item.fineId);
   if(original && original.status !== "paid"){
     original.status = "payment_pending";
     original.paymentId = item.id;
   }
 
-  writeDb(db);
+  await writeDbAsync(db);
 
   const ch=await channel(CONFIG.channels.finePayments);
   const paymentPlayerLabel=await discordPlayerLabel(item);
@@ -2038,8 +2183,10 @@ app.post("/api/warnings", protect, async (req,res)=>{
     if(member&&typeof canDisciplineAll==="function"&&!canDisciplineAll(member,req)) return denyPerm(res,"Недостатньо прав для штрафів/доган.");
     const db=readDb(); db.warnings=Array.isArray(db.warnings)?db.warnings:[];
     const expires=new Date(Date.now()+CONFIG.warnings.days*86400000);
-    const targetMember=await findDiscordMemberForRecord(req.body||{});
-    const item={id:nextSimpleId(db,"warn",["warnings"]),nickname:req.body.nickname||req.body.nick||"",staticId:req.body.staticId||req.body.playerId||"",discordUserId:targetMember?.id||req.body.discordUserId||"",reason:req.body.reason||"",screenshotUrl:safeRemoteMediaUrl(req.body.screenshotUrl),status:"active",expiresAt:expires.toISOString(),createdAt:now(),createdBy:member.displayName||member.user?.username||"",createdByDiscordId:member.id};
+    let centralTarget=findCentralMember(db,req.body||{});
+    const targetMember=await findDiscordMemberForRecord(centralTarget||req.body||{});
+    if(!centralTarget&&targetMember)centralTarget=upsertCentralMember(db,{...req.body,discordUserId:targetMember.id,nickname:targetMember.displayName});
+    const item={id:nextSimpleId(db,"warn",["warnings"]),nickname:req.body.nickname||req.body.nick||"",staticId:req.body.staticId||req.body.playerId||"",targetMemberId:centralTarget?.memberId||"",discordUserId:centralTarget?.discordUserId||targetMember?.id||req.body.discordUserId||"",reason:req.body.reason||"",screenshotUrl:safeRemoteMediaUrl(req.body.screenshotUrl),status:"active",expiresAt:expires.toISOString(),createdAt:now(),createdBy:member.displayName||member.user?.username||"",createdByDiscordId:member.id};
     db.warnings.unshift(item);
     addUserNotification(db, {
       discordUserId: item.discordUserId,
@@ -2065,19 +2212,23 @@ app.post("/api/warning-payments", protect, async (req,res)=>{
     const member = await requireFamilyRole(req, res); if(!member) return;
     const db=readDb();
     db.warningPayments = Array.isArray(db.warningPayments) ? db.warningPayments : [];
-    const targetMember=await findDiscordMemberForRecord(req.body||{});
+    const original=(db.warnings||[]).find(w=>String(w.id)===String(req.body.warningId||""));
+    let centralTarget=findCentralMember(db,{memberId:original?.targetMemberId,...req.body});
+    const targetMember=await findDiscordMemberForRecord(centralTarget||original||req.body||{});
+    if(!centralTarget&&targetMember)centralTarget=upsertCentralMember(db,{...(original||req.body),discordUserId:targetMember.id,nickname:targetMember.displayName});
     const item={
       id:id("warnpay"),
       warningId:req.body.warningId||"",
       nickname:req.body.nickname||req.body.nick||"",
       staticId:req.body.staticId||req.body.playerId||"",
       screenshotUrl:safeRemoteMediaUrl(req.body.screenshotUrl),
-      discordUserId:targetMember?.id||req.body.discordUserId||"",
+      targetMemberId:centralTarget?.memberId||original?.targetMemberId||"",
+      discordUserId:centralTarget?.discordUserId||targetMember?.id||original?.discordUserId||req.body.discordUserId||"",
       status:"pending",
       createdAt:now()
     };
     db.warningPayments.unshift(item);
-    writeDb(db);
+    await writeDbAsync(db);
     const ch=await channel(CONFIG.channels.warningRemoval);
     const warningPaymentPlayerLabel=await discordPlayerLabel(item);
     if(ch) await sendWithOptionalScreenshot(ch, {
@@ -2452,7 +2603,11 @@ app.get("/api/public-dashboard", async (req,res)=>{
   try{
     res.set("Cache-Control","no-store, no-cache, must-revalidate, private");
     const db=readDb();
-    const members=await getPublicMembersFromDiscord();
+    const discordMembers=await getPublicMembersFromDiscord();
+    const dbMembersChanged=[];
+    for(const source of discordMembers){const saved=upsertCentralMember(db,source);saved.roles=source.roles||[];dbMembersChanged.push(saved);}
+    if(dbMembersChanged.length){backfillCentralMemberRelations(db);await writeDbAsync(db);}
+    const members=dbMembersChanged.map(publicCentralMember);
     const cars=publicCleanCars(db);
     const gallery=publicCleanGallery(db);
     const familyInfo=db.familyInfo||{};
@@ -2471,12 +2626,14 @@ app.get("/api/public-dashboard", async (req,res)=>{
 
 
 app.get("/api/members-public", async (req,res)=>{
-  try{ const members=await getPublicMembersFromDiscord(); const onlineCount=members.filter(m=>m.online||m.isOnline||/^(online|idle|dnd)$/i.test(String(m.status||m.presence||""))).length; res.json({ok:true,count:members.length,onlineCount,members}); }
+  try{ const discordMembers=await getPublicMembersFromDiscord(); const db=readDb(); const saved=discordMembers.map(m=>{const x=upsertCentralMember(db,m);x.roles=m.roles||[];return x;}); if(saved.length){backfillCentralMemberRelations(db);await writeDbAsync(db);} const members=saved.map(publicCentralMember); const onlineCount=discordMembers.filter(m=>m.online||m.isOnline||/^(online|idle|dnd)$/i.test(String(m.status||m.presence||""))).length; res.json({ok:true,count:members.length,onlineCount,members}); }
   catch(e){ console.error("members public error",e); res.status(500).json({ok:false,error:"members_public_failed",message:e.message}); }
 });
 app.get("/api/members", protect, async (req,res)=>{
   try{
-    const members = await getGuildMembersSimple();
+    const source = await getGuildMembersSimple();
+    const db=readDb(); const saved=source.map(m=>{const x=upsertCentralMember(db,m);x.roles=m.roles||[];return x;}); if(saved.length){backfillCentralMemberRelations(db);await writeDbAsync(db);}
+    const members = saved.map(publicCentralMember);
     // Public registry: no Discord IDs are returned, only nickname and roles.
     res.json({ok:true,members});
   }catch(e){
@@ -2854,7 +3011,8 @@ client.on("interactionCreate", async interaction=>{
       if(action==="capt_yes"){
         c.yes.push(interaction.user.id);
         const start=parseCaptDateTime(c);
-        c.participants.push({captId:c.id,discordUserId:interaction.user.id,nickname:member.displayName||interaction.user.username,registeredAt:new Date().toISOString(),startsAt:start?.toISOString()||"",status:"registered"});
+        const central=upsertCentralMember(db,{discordUserId:interaction.user.id,nickname:member.displayName||interaction.user.username});
+        c.participants.push({captId:c.id,memberId:central.memberId,discordUserId:central.discordUserId,nickname:central.gameNickname||member.displayName||interaction.user.username,registeredAt:new Date().toISOString(),startsAt:start?.toISOString()||"",status:"registered"});
         addUserNotification(db,{discordUserId:interaction.user.id,type:"capt_registered",title:"Ви записані на капт",message:`Початок: ${c.time||"--:--"}. Проти: ${c.enemy||"не вказано"}.`,entityType:"capt",entityId:c.id});
       }
       if(action==="capt_no") c.no.push(interaction.user.id);
@@ -3000,7 +3158,8 @@ function kyivLocalToDate(year, month, day, hour, minute){
 async function findDiscordMemberForRecord(record={}){
   try{
     const guild = await client.guilds.fetch(CONFIG.guildId);
-    const directId = String(record.discordUserId || record.userId || record.memberId || record.discordId || "").replace(/\D/g,"");
+    const central=findCentralMember(readDb(),record);
+    const directId = normalizeDiscordUserId(central?.discordUserId || record.discordUserId || record.userId || record.discordId);
     if(directId){
       const direct = await guild.members.fetch(directId).catch(()=>null);
       if(direct) return direct;
@@ -3112,7 +3271,7 @@ async function sendCaptReminder(captId,minutes){
   // Use the current server-side list for every threshold. Changes made after
   // the 20-minute reminder must be reflected by the 10-minute reminder.
   const participantRecords=(capt.participants||[]).filter(p=>String(p.status||"registered")==="registered");
-  const participantIds=[...new Set(participantRecords.map(p=>String(p.discordUserId||p.userId||"")).filter(Boolean))];
+  const participantIds=[...new Set(participantRecords.map(p=>String(findCentralMember(db,p)?.discordUserId||p.discordUserId||p.userId||"")).filter(Boolean))];
   // Backward compatibility for capts created before participant records existed.
   if(!Array.isArray(capt.participants))participantIds.push(...(capt.yes||[]).map(String).filter(Boolean));
   const uniqueIds=[...new Set(participantIds)];
@@ -4737,12 +4896,15 @@ app.get("/api/members-autofill", async (req,res)=>{
   try{
     res.set("Cache-Control","no-store, no-cache, must-revalidate, private");
     const map = new Map();
+    const db=readDb();
 
     // 1) Discord members
     try{
       const discordMembers = await getPublicMembersFromDiscord();
       for(const m of discordMembers || []){
-        _autoAddMember(map, m.nick || m.nickname || m.username, m.staticId || m.playerId, m.roles || [], "discord", m.discordUserId || m.discordId);
+        const saved=upsertCentralMember(db,m); saved.roles=m.roles||[];
+        const dto=publicCentralMember(saved);
+        map.set("member:"+dto.memberId,dto);
       }
     }catch(e){
       console.warn("members-autofill discord source failed", e?.message || e);
@@ -4750,6 +4912,8 @@ app.get("/api/members-autofill", async (req,res)=>{
 
     // Historical DB records are intentionally not merged here. Autocomplete is
     // an active roster and must not resurrect members removed from Discord.
+    backfillCentralMemberRelations(db);
+    await writeDbAsync(db);
     const members = Array.from(new Set(Array.from(map.values())))
       .filter(x=>x.nick && x.nick !== "-")
       .sort((a,b)=>String(a.nick).localeCompare(String(b.nick),"uk"));
@@ -4836,8 +5000,7 @@ function ensureComplaintsDb(db){
   return db;
 }
 function discordIdForStaticId(db,staticId){
-  const wanted=String(staticId||"");
-  const member=(db.members||[]).find(item=>String(item.staticId||item.playerId||item.gameId||"")===wanted);
+  const member=findCentralMember(db,{gameId:staticId});
   return String(member?.discordUserId||member?.userId||member?.discordId||"");
 }
 function nextComplaintNumber(db){
@@ -5120,7 +5283,7 @@ app.listen(PORT, ()=>{
 });
 
 initDb()
-  .then(async()=>{console.log("✅ DB initialized"); try{const m=await ensureMediaSystem(); (m.logs||[]).forEach(x=>console.log("✅ "+x)); console.log("✅ FORBES media system ready");}catch(e){console.error("⚠️ Media init failed:",e.message);}})
+  .then(async()=>{console.log("✅ DB initialized"); const db=readDb(); if(backfillCentralMemberRelations(db))await writeDbAsync(db); try{const m=await ensureMediaSystem(); (m.logs||[]).forEach(x=>console.log("✅ "+x)); console.log("✅ FORBES media system ready");}catch(e){console.error("⚠️ Media init failed:",e.message);}})
   .catch(e=>console.error("⚠️ DB init failed, continuing:", e?.message || e))
   .finally(()=>{
     if(!process.env.DISCORD_BOT_TOKEN){

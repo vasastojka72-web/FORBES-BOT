@@ -56,6 +56,24 @@ function pruneWebSsoTickets(){
   for(const [ticket,item] of webSsoTickets)if(!item||item.expiresAt<=time)webSsoTickets.delete(ticket);
 }
 
+function discordRolesForProfile(member){
+  const hiddenRoleIds=new Set([String(CONFIG.roles?.bot||""),String(COMPLAINT_ADMIN_ROLE_ID||"")].filter(Boolean));
+  return member.roles.cache
+    .filter(role=>role.name!=="@everyone")
+    .sort((a,b)=>b.position-a.position)
+    .map(role=>({id:role.id,name:role.name,position:role.position,managed:Boolean(role.managed)}))
+    .filter(role=>!role.managed&&!hiddenRoleIds.has(String(role.id)));
+}
+
+async function currentDiscordProfile(user){
+  const guild=await client.guilds.fetch(CONFIG.guildId);
+  const member=await guild.members.fetch(String(user.id));
+  const roles=discordRolesForProfile(member);
+  const highestRole=roles[0]||null;
+  const name=member.nickname||member.displayName||user.globalName||user.global_name||user.name||user.username||"Discord";
+  return {...user,id:member.id,name,roles,highestRole,highestRoleName:highestRole?.name||"Учасник"};
+}
+
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildPresences, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
   partials: [Partials.Channel, Partials.Message]
@@ -830,9 +848,18 @@ app.get("/auth/launcher",async(req,res)=>{
   return res.redirect(target.toString());
 });
 
-app.get("/api/auth/session",protect,requireLauncherSession,(req,res)=>{
-  const {id,name,username,avatar,roles,highestRole,highestRoleName}=req.user||{};
-  res.json({ok:true,authenticated:true,user:{id,name,username,avatar,roles:roles||[],highestRole:highestRole||null,highestRoleName:highestRoleName||highestRole?.name||"FORBES Member"}});
+app.get("/api/auth/session",protect,requireLauncherSession,async(req,res)=>{
+  try{
+    const user=await currentDiscordProfile(req.user||{});
+    const db=readDb();
+    const parsed=parseForbesStaticNickFinal(user.name);
+    const central=upsertCentralMember(db,{discordUserId:user.id,nickname:parsed.nick||user.name,staticId:parsed.staticId,roles:user.roles,highestRole:user.highestRole,highestRoleName:user.highestRoleName});
+    await writeDbAsync(db);
+    res.json({ok:true,authenticated:true,user:{...user,memberId:central.memberId}});
+  }catch(error){
+    console.error("Live auth session refresh failed:",error?.message||error);
+    res.status(403).json({ok:false,authenticated:false,error:"discord_membership_unavailable"});
+  }
 });
 
 app.post("/api/auth/logout",(req,res)=>{
@@ -894,10 +921,7 @@ app.get("/auth/discord/callback", async (req, res) => {
 
       serverNick = member.nickname || member.displayName || user.global_name || user.username;
 
-      roles = member.roles.cache
-        .filter(r => r.name !== "@everyone")
-        .sort((a, b) => b.position - a.position)
-        .map(r => ({ id: r.id, name: r.name, position: r.position }));
+      roles = discordRolesForProfile(member);
     } catch (e) {
       console.log("Guild member fetch failed:", e?.message || e);
       serverNick = user.global_name || user.username || "Discord";

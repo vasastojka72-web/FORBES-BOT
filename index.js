@@ -561,6 +561,7 @@ app.get("/api/launcher/access",protect,requireLauncherSession,async(req,res)=>{
 });
 
 app.get("/api/launcher/notifications", protect, requireForbesMembership, async (req,res)=>{
+  res.set("Cache-Control","no-store, no-cache, must-revalidate, private");
   const discordUserId = String(req.user?.id || "");
   if(!discordUserId || req.user?.guest){
     return res.status(401).json({ok:false,error:"auth_required",message:"Discord authorization is required."});
@@ -569,28 +570,37 @@ app.get("/api/launcher/notifications", protect, requireForbesMembership, async (
   const since = String(req.query.since || "");
   const db = readDb();
   const currentMember=findCentralMember(db,{discordUserId});
-  const belongsToCurrent=item=>String(item?.recipientMemberId||item?.memberId||item?.targetMemberId||"")===String(currentMember?.memberId||" ")||String(item?.discordUserId||item?.userId||"")===discordUserId;
+  const belongsToCurrent=item=>{
+    if(String(item?.recipientMemberId||item?.memberId||item?.targetMemberId||"")===String(currentMember?.memberId||" "))return true;
+    if(String(item?.discordUserId||item?.recipientDiscordUserId||item?.userId||"")===discordUserId)return true;
+    const itemGameId=normalizeGameId(item?.gameId||item?.staticId||item?.playerId);
+    const currentGameId=normalizeGameId(currentMember?.gameId||currentMember?.staticId);
+    if(itemGameId&&currentGameId&&itemGameId===currentGameId)return true;
+    const itemNick=normalizeMemberNickname(item?.gameNickname||item?.nickname||item?.nick).toLowerCase();
+    const currentNick=normalizeMemberNickname(currentMember?.gameNickname||currentMember?.nickname).toLowerCase();
+    return Boolean(itemNick&&currentNick&&itemNick===currentNick);
+  };
   const beforeMaterialize = Array.isArray(db.notifications) ? db.notifications.length : 0;
   // Rebuild personal events from the canonical records as a safety net. This
   // also repairs older records created before notification delivery existed.
   for(const fine of (Array.isArray(db.fines) ? db.fines : [])){
     if(belongsToCurrent(fine) && !String(fine.id||"").startsWith("finepay_"))
-      addUserNotification(db,{discordUserId,type:"fine_created",title:"Новий штраф",message:`${fine.reason||"Без причини"}. Сума: ${money(fine.amount||0)}.`,entityType:"fine",entityId:fine.id});
+      addUserNotification(db,{recipientMemberId:currentMember?.memberId,discordUserId,type:"fine_created",title:"Новий штраф",message:`${fine.reason||"Без причини"}. Сума: ${money(fine.amount||0)}.`,entityType:"fine",entityId:fine.id});
   }
   for(const warning of (Array.isArray(db.warnings) ? db.warnings : [])){
     if(belongsToCurrent(warning))
-      addUserNotification(db,{discordUserId,type:"warning_created",title:"Нова догана",message:warning.reason||"Причину не вказано.",entityType:"warning",entityId:warning.id});
+      addUserNotification(db,{recipientMemberId:currentMember?.memberId,discordUserId,type:"warning_created",title:"Нова догана",message:warning.reason||"Причину не вказано.",entityType:"warning",entityId:warning.id});
   }
   for(const report of (Array.isArray(db.farmReports) ? db.farmReports : [])){
     const status=String(report.status||"");
     if(status!=="approved"&&status!=="rejected") continue;
     const isAuthor=belongsToCurrent(report);
     const isParticipant=(Array.isArray(report.players)?report.players:[]).some(belongsToCurrent);
-    if(isAuthor||isParticipant) addUserNotification(db,{discordUserId,type:status==="approved"?"farm_report_approved":"farm_report_rejected",title:isParticipant&&!isAuthor?(status==="approved"?"Фарм-звіт з вашою участю прийнято":"Фарм-звіт з вашою участю відхилено"):(status==="approved"?"Звіт схвалено":"Звіт відхилено"),message:`Фарм-звіт ${report.id} ${status==="approved"?"прийнято":"відхилено"}.`,entityType:"farm_report",entityId:report.id});
+    if(isAuthor||isParticipant) addUserNotification(db,{recipientMemberId:currentMember?.memberId,discordUserId,type:status==="approved"?"farm_report_approved":"farm_report_rejected",title:isParticipant&&!isAuthor?(status==="approved"?"Фарм-звіт з вашою участю прийнято":"Фарм-звіт з вашою участю відхилено"):(status==="approved"?"Звіт схвалено":"Звіт відхилено"),message:`Фарм-звіт ${report.id} ${status==="approved"?"прийнято":"відхилено"}.`,entityType:"farm_report",entityId:report.id});
   }
   for(const capt of (Array.isArray(db.capts) ? db.capts : [])){
     const registered=(Array.isArray(capt.participants)?capt.participants:[]).some(belongsToCurrent);
-    if(registered) addUserNotification(db,{discordUserId,type:"capt_registered",title:"Ви записані на капт",message:`${capt.date||"Дата не вказана"} о ${capt.time||"--:--"}. Проти: ${capt.enemy||"не вказано"}.`,entityType:"capt",entityId:capt.id});
+    if(registered) addUserNotification(db,{recipientMemberId:currentMember?.memberId,discordUserId,type:"capt_registered",title:"Ви записані на капт",message:`${capt.date||"Дата не вказана"} о ${capt.time||"--:--"}. Проти: ${capt.enemy||"не вказано"}.`,entityType:"capt",entityId:capt.id});
   }
   if((db.notifications||[]).length!==beforeMaterialize) await writeDbAsync(db);
   let notifications = (Array.isArray(db.notifications) ? db.notifications : [])
@@ -2068,7 +2078,7 @@ app.post("/api/fines", protect, async (req,res)=>{
     db.fines = Array.isArray(db.fines) ? db.fines : [];
     let centralTarget=findCentralMember(db,req.body||{});
     const targetMember = await findDiscordMemberForRecord(centralTarget||req.body||{});
-    if(!centralTarget&&targetMember)centralTarget=upsertCentralMember(db,{...req.body,discordUserId:targetMember.id,nickname:targetMember.displayName});
+    if(targetMember)centralTarget=upsertCentralMember(db,{memberId:centralTarget?.memberId,...req.body,discordUserId:targetMember.id,nickname:targetMember.displayName});
     const item={
       id:id("fine"),
       nickname:req.body.nickname||req.body.nick||"",
@@ -2085,6 +2095,7 @@ app.post("/api/fines", protect, async (req,res)=>{
     };
     db.fines.unshift(item);
     addUserNotification(db, {
+      recipientMemberId: item.targetMemberId,
       discordUserId: item.discordUserId,
       type: "fine_created",
       title: "Новий штраф",
@@ -2185,10 +2196,11 @@ app.post("/api/warnings", protect, async (req,res)=>{
     const expires=new Date(Date.now()+CONFIG.warnings.days*86400000);
     let centralTarget=findCentralMember(db,req.body||{});
     const targetMember=await findDiscordMemberForRecord(centralTarget||req.body||{});
-    if(!centralTarget&&targetMember)centralTarget=upsertCentralMember(db,{...req.body,discordUserId:targetMember.id,nickname:targetMember.displayName});
+    if(targetMember)centralTarget=upsertCentralMember(db,{memberId:centralTarget?.memberId,...req.body,discordUserId:targetMember.id,nickname:targetMember.displayName});
     const item={id:nextSimpleId(db,"warn",["warnings"]),nickname:req.body.nickname||req.body.nick||"",staticId:req.body.staticId||req.body.playerId||"",targetMemberId:centralTarget?.memberId||"",discordUserId:centralTarget?.discordUserId||targetMember?.id||req.body.discordUserId||"",reason:req.body.reason||"",screenshotUrl:safeRemoteMediaUrl(req.body.screenshotUrl),status:"active",expiresAt:expires.toISOString(),createdAt:now(),createdBy:member.displayName||member.user?.username||"",createdByDiscordId:member.id};
     db.warnings.unshift(item);
     addUserNotification(db, {
+      recipientMemberId: item.targetMemberId,
       discordUserId: item.discordUserId,
       type: "warning_created",
       title: "Нова догана",
@@ -3164,8 +3176,8 @@ async function findDiscordMemberForRecord(record={}){
       const direct = await guild.members.fetch(directId).catch(()=>null);
       if(direct) return direct;
     }
-    const wantedNick = String(record.nickname || record.nick || record.player || record.name || "").trim().toLowerCase();
-    const wantedStatic = String(record.staticId || record.playerId || record.id || "").trim();
+    const wantedNick = String(record.gameNickname || record.game_nickname || record.nickname || record.nick || record.player || record.name || "").trim().toLowerCase();
+    const wantedStatic = String(record.gameId || record.game_id || record.staticId || record.playerId || record.id || "").trim();
     const members = await guild.members.fetch().catch(()=>guild.members.cache);
     let nickMatch = null;
     for(const m of members.values()){

@@ -428,7 +428,7 @@ function _autoParseNickId(raw){
   if(/^\d{15,25}$/.test(staticId)) staticId = "";
   return {nick, staticId};
 }
-function _autoAddMember(map, nick, staticId, roles=[], source="db"){
+function _autoAddMember(map, nick, staticId, roles=[], source="db", discordUserId=""){
   const parsed = _autoParseNickId(nick);
   nick = parsed.nick || nick;
   staticId = String(staticId || parsed.staticId || "").trim();
@@ -437,6 +437,8 @@ function _autoAddMember(map, nick, staticId, roles=[], source="db"){
   const key = (staticId ? "id:"+staticId : "nick:"+nick.toLowerCase());
   const prev = map.get(key) || map.get("nick:"+nick.toLowerCase());
   const item = prev || {nick, nickname:nick, staticId:"", playerId:"", roles:[], sources:[]};
+  discordUserId = String(discordUserId || "").replace(/\D/g, "");
+  if(discordUserId){ item.discordUserId = discordUserId; item.discordId = discordUserId; }
   if(staticId && !item.staticId){ item.staticId = staticId; item.playerId = staticId; }
   const roleNames = new Set((item.roles||[]).map(r=>String(r.name||r)));
   for(const r of roles || []){
@@ -4708,7 +4710,7 @@ app.get("/api/members-autofill", async (req,res)=>{
     try{
       const discordMembers = await getPublicMembersFromDiscord();
       for(const m of discordMembers || []){
-        _autoAddMember(map, m.nick || m.nickname || m.username, m.staticId || m.playerId, m.roles || [], "discord");
+        _autoAddMember(map, m.nick || m.nickname || m.username, m.staticId || m.playerId, m.roles || [], "discord", m.discordUserId || m.discordId);
       }
     }catch(e){
       console.warn("members-autofill discord source failed", e?.message || e);

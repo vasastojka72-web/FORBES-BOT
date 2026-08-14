@@ -616,7 +616,9 @@ app.get("/api/launcher/capts/me/upcoming",protect,requireForbesMembership,(req,r
   const db=readDb(), nowMs=Date.now();
   const capts=(Array.isArray(db.capts)?db.capts:[])
     .filter(c=>String(c.status||"").toLowerCase()!=="closed")
-    .filter(c=>(c.participants||[]).some(p=>String(p.discordUserId||p.userId||p)===userId&&String(p.status||"registered")==="registered")||(c.yes||[]).map(String).includes(userId))
+    .filter(c=>Array.isArray(c.participants)
+      ? c.participants.some(p=>String(p.discordUserId||p.userId||p)===userId&&String(p.status||"registered")==="registered")
+      : (c.yes||[]).map(String).includes(userId))
     .map(c=>({capt:c,start:parseCaptDateTime(c)}))
     .filter(x=>x.start&&x.start.getTime()>nowMs)
     .sort((a,b)=>a.start-b.start)
@@ -3073,10 +3075,12 @@ async function sendCaptReminder(captId,minutes){
   db.captReminderDeliveries=db.captReminderDeliveries||{};
   const deliveryKey=`${capt.id}:${minutes}min`;
   if(db.captReminderDeliveries[deliveryKey])return false;
-  const participantRecords=(capt.participants||[]).filter(p=>String(p.status||"registered")==="registered"&&(!p.registeredAt||Date.parse(p.registeredAt)<=reminderAt));
+  // Use the current server-side list for every threshold. Changes made after
+  // the 20-minute reminder must be reflected by the 10-minute reminder.
+  const participantRecords=(capt.participants||[]).filter(p=>String(p.status||"registered")==="registered");
   const participantIds=[...new Set(participantRecords.map(p=>String(p.discordUserId||p.userId||"")).filter(Boolean))];
   // Backward compatibility for capts created before participant records existed.
-  if(!participantRecords.length)participantIds.push(...(capt.yes||[]).map(String).filter(Boolean));
+  if(!Array.isArray(capt.participants))participantIds.push(...(capt.yes||[]).map(String).filter(Boolean));
   const uniqueIds=[...new Set(participantIds)];
   if(!uniqueIds.length){
     db.captReminderDeliveries[deliveryKey]={sentAt:new Date().toISOString(),recipientCount:0,skipped:"no_participants"};
@@ -3085,69 +3089,23 @@ async function sendCaptReminder(captId,minutes){
   const ch=await channel(CONFIG.channels.captReminder);
   if(!ch)return false;
   const mentions=uniqueIds.map(userId=>`<@${userId}> | ID: ${userId}`).join("\n");
-  await ch.send({content:uniqueIds.map(userId=>`<@${userId}>`).join(" "),allowedMentions:{users:uniqueIds},embeds:[embed(`⚔ КАПТ ЧЕРЕЗ ${minutes} ХВИЛИН`,`**Початок:** ${capt.time||"--:--"}\n**Проти:** ${capt.enemy||"не вказано"}\n\n**Записані:**\n${mentions}`)]});
+  await ch.send({content:uniqueIds.map(userId=>`<@${userId}>`).join(" "),allowedMentions:{parse:[],users:uniqueIds,roles:[],repliedUser:false},embeds:[embed(`⚔ КАПТ ЧЕРЕЗ ${minutes} ХВИЛИН`,`**Початок:** ${capt.time||"--:--"}\n**Проти:** ${capt.enemy||"не вказано"}\n\n**Записані:**\n${mentions}`)]});
   db.captReminderDeliveries[deliveryKey]={sentAt:new Date().toISOString(),recipientCount:uniqueIds.length,channelId:CONFIG.channels.captReminder};
   await writeDbAsync(db);
   console.log("capt reminder sent",{captId:capt.id,minutes,recipientCount:uniqueIds.length});
   return true;
 }
 
-async function sendCaptReminder15(captId){
-  const db = readDb();
-  const c = db.capts.find(x => x.id === captId);
-  if(!c || c.status === "closed" || c.reminded15) return false;
-
-  const ch = await channel(CONFIG.channels.captSignup);
-  if(!ch) return false;
-
-  const yes = await formatCaptIds(c.yes || []);
-  const no = await formatCaptIds(c.no || []);
-  const maybe = await formatCaptIds(c.maybe || []);
-
-  await ch.send({
-    embeds:[embed("⏰ Нагадування за 15 хв до капта",
-      `**Капт №:** ${c.id}\n` +
-      `**Час:** ${c.time || "-"} по Києву\n` +
-      `**Проти:** ${c.enemy || "-"}\n` +
-      `**Потрібно людей:** ${c.neededPlayers || "-"}\n\n` +
-      `✅ **Будуть:**\n${yes}\n\n` +
-      `❓ **Не знають:**\n${maybe}\n\n` +
-      `❌ **Не будуть:**\n${no}\n\n` +
-      `Каптери, перевірте список і заходьте готуватись.`
-    )]
-  });
-
-  c.reminded15 = true;
-  c.reminded15At = now();
-  writeDb(db);
-  return true;
-}
-
 function scheduleCaptReminder(captId){
-  // Periodic persisted scheduler below handles both thresholds and survives restarts.
+  // Capt creation only wakes the persistent poller. No long setTimeout is
+  // retained, so the scheduler safely resumes after a Bot restart.
   checkCaptReminders().catch(console.error);
-  return;
-  const db = readDb();
-  const c = db.capts.find(x => x.id === captId);
-  if(!c) return;
-
-  const dt = parseCaptDateTime(c);
-  if(!dt) return;
-
-  const remindAt = dt.getTime() - 15 * 60 * 1000;
-  const delay = remindAt - Date.now();
-
-  if(delay <= 0 && Date.now() <= dt.getTime() && !c.reminded15){
-    sendCaptReminder15(captId).catch(console.error);
-    return;
-  }
-
-  if(delay > 0){
-    setTimeout(()=>sendCaptReminder15(captId).catch(console.error), delay);
-  }
 }
 
+let captReminderCheckRunning=false;
 async function checkCaptReminders(){
+  if(captReminderCheckRunning)return;
+  captReminderCheckRunning=true;
   try{
     const db = readDb();
     const nowMs = Date.now();
@@ -3163,6 +3121,8 @@ async function checkCaptReminders(){
     }
   }catch(e){
     console.error("checkCaptReminders error:", e);
+  }finally{
+    captReminderCheckRunning=false;
   }
 }
 
@@ -3374,6 +3334,8 @@ async function getGuildMembersSimple(){
       .map(r => ({id:r.id,name:r.name,position:Number(r.position||0)}))
       .sort((a,b)=>(b.position||0)-(a.position||0));
     members.push({
+      discordUserId: member.id,
+      discordId: member.id,
       nickname: parsed.nick,
       nick: parsed.nick,
       username: member.user.username,

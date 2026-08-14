@@ -472,7 +472,7 @@ app.get("/api/launcher/access",protect,requireLauncherSession,async(req,res)=>{
   res.json({ok:true,allowed:access.allowed,reason:access.reason,checkedAt,validUntil});
 });
 
-app.get("/api/launcher/notifications", protect, requireForbesMembership, (req,res)=>{
+app.get("/api/launcher/notifications", protect, requireForbesMembership, async (req,res)=>{
   const discordUserId = String(req.user?.id || "");
   if(!discordUserId || req.user?.guest){
     return res.status(401).json({ok:false,error:"auth_required",message:"Discord authorization is required."});
@@ -480,6 +480,29 @@ app.get("/api/launcher/notifications", protect, requireForbesMembership, (req,re
   const limit = Math.min(Math.max(Number(req.query.limit || 50), 1), 100);
   const since = String(req.query.since || "");
   const db = readDb();
+  const beforeMaterialize = Array.isArray(db.notifications) ? db.notifications.length : 0;
+  // Rebuild personal events from the canonical records as a safety net. This
+  // also repairs older records created before notification delivery existed.
+  for(const fine of (Array.isArray(db.fines) ? db.fines : [])){
+    if(String(fine.discordUserId||"")===discordUserId && !String(fine.id||"").startsWith("finepay_"))
+      addUserNotification(db,{discordUserId,type:"fine_created",title:"Новий штраф",message:`${fine.reason||"Без причини"}. Сума: ${money(fine.amount||0)}.`,entityType:"fine",entityId:fine.id});
+  }
+  for(const warning of (Array.isArray(db.warnings) ? db.warnings : [])){
+    if(String(warning.discordUserId||"")===discordUserId)
+      addUserNotification(db,{discordUserId,type:"warning_created",title:"Нова догана",message:warning.reason||"Причину не вказано.",entityType:"warning",entityId:warning.id});
+  }
+  for(const report of (Array.isArray(db.farmReports) ? db.farmReports : [])){
+    const status=String(report.status||"");
+    if(status!=="approved"&&status!=="rejected") continue;
+    const isAuthor=String(report.discordUserId||"")===discordUserId;
+    const isParticipant=(Array.isArray(report.players)?report.players:[]).some(p=>String(p?.discordUserId||p?.userId||"")===discordUserId);
+    if(isAuthor||isParticipant) addUserNotification(db,{discordUserId,type:status==="approved"?"farm_report_approved":"farm_report_rejected",title:isParticipant&&!isAuthor?(status==="approved"?"Фарм-звіт з вашою участю прийнято":"Фарм-звіт з вашою участю відхилено"):(status==="approved"?"Звіт схвалено":"Звіт відхилено"),message:`Фарм-звіт ${report.id} ${status==="approved"?"прийнято":"відхилено"}.`,entityType:"farm_report",entityId:report.id});
+  }
+  for(const capt of (Array.isArray(db.capts) ? db.capts : [])){
+    const registered=(Array.isArray(capt.participants)?capt.participants:[]).some(p=>String(p?.discordUserId||p?.userId||p)===discordUserId);
+    if(registered) addUserNotification(db,{discordUserId,type:"capt_registered",title:"Ви записані на капт",message:`${capt.date||"Дата не вказана"} о ${capt.time||"--:--"}. Проти: ${capt.enemy||"не вказано"}.`,entityType:"capt",entityId:capt.id});
+  }
+  if((db.notifications||[]).length!==beforeMaterialize) await writeDbAsync(db);
   let notifications = (Array.isArray(db.notifications) ? db.notifications : [])
     .filter(item => String(item.discordUserId) === discordUserId);
   /* Personal notifications and announcements are intentionally separate feeds.
@@ -1254,7 +1277,7 @@ app.post("/api/applications", protect, async (req,res)=>{
     }
 
     db.applications.unshift(item);
-    writeDb(db);
+    await writeDbAsync(db);
 
     
     const chId = typeLower.includes("увал") || typeLower.includes("звіль") || typeLower === "dismissal"
@@ -1456,7 +1479,7 @@ if(!memberHasRealServerRole(member)){
     db.farmReports = Array.isArray(db.farmReports) ? db.farmReports : [];
     db.farmReports.unshift(item);
     trimSystemLogs(db);
-    writeDb(db);
+    await writeDbAsync(db);
 
     const components = [row([
       {id:`farm_approve:${item.id}`,label:"✅ Одобрити",style:ButtonStyle.Success},
@@ -1927,7 +1950,7 @@ app.post("/api/fines", protect, async (req,res)=>{
       entityType: "fine",
       entityId: item.id
     });
-    writeDb(db);
+    await writeDbAsync(db);
 
     const playerLabel = await discordPlayerLabel(item);
     const issuerLabel = `${member.displayName||member.user?.username||item.createdBy} (<@${member.id}>)`;
@@ -2026,7 +2049,7 @@ app.post("/api/warnings", protect, async (req,res)=>{
       entityType: "warning",
       entityId: item.id
     });
-    writeDb(db);
+    await writeDbAsync(db);
     const count=db.warnings.filter(w=>w.staticId===item.staticId&&w.status==="active").length;
     const ch=await channel(CONFIG.channels.warnings);
     if(ch){

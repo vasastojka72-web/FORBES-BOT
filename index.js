@@ -1418,7 +1418,16 @@ if(!memberHasRealServerRole(member)){
     if(screenshotFile.tooLarge){
       return publicError(res,400,"screenshot_too_large",`Скріншот завеликий (${screenshotFile.sizeMb}MB). Максимум ${screenshotFile.maxMb}MB.`);
     }
-    const players = Array.isArray(req.body.players) ? req.body.players : [];
+    const submittedPlayers = Array.isArray(req.body.players) ? req.body.players : [];
+    const players = [];
+    for(const player of submittedPlayers){
+      const resolved = await findDiscordMemberForRecord(player || {});
+      players.push({
+        ...player,
+        staticId:player?.staticId || player?.playerId || player?.id || "",
+        discordUserId:resolved?.id || player?.discordUserId || player?.discordId || player?.userId || ""
+      });
+    }
     const amount = Number(req.body.amount || req.body.contractAmount || 0);
     const each = Number(req.body.each || (players.length ? Math.floor(amount * 0.8 / players.length) : 0));
     const familyShare = Number(req.body.familyShare || Math.floor(amount * 0.2));
@@ -1547,7 +1556,7 @@ app.post("/api/farm-reports/:id/status", protect, async (req,res)=>{
     });
     for(const player of (report.players||[])){
       const playerId=String(player?.discordUserId||player?.userId||"");
-      if(playerId&&playerId!==String(report.discordUserId||""))addUserNotification(db,{discordUserId:playerId,type:status==="approved"?"farm_report_approved":"farm_report_rejected",title:status==="approved"?"Фарм-звіт схвалено":"Фарм-звіт відхилено",message:`Фарм-звіт ${report.id}: ${status}`,entityType:"farm_report",entityId:report.id});
+      if(playerId&&playerId!==String(report.discordUserId||""))addUserNotification(db,{discordUserId:playerId,type:status==="approved"?"farm_report_approved":"farm_report_rejected",title:status==="approved"?"Фарм-звіт з вашою участю прийнято":"Фарм-звіт з вашою участю відхилено",message:`Фарм-звіт ${report.id} ${status==="approved"?"прийнято":"відхилено"}.`,entityType:"farm_report",entityId:report.id});
     }
     writeDb(db);
 
@@ -2793,7 +2802,7 @@ client.on("interactionCreate", async interaction=>{
       });
       for(const player of (r.players||[])){
         const playerId=String(player?.discordUserId||player?.userId||"");
-        if(playerId&&playerId!==String(r.discordUserId||""))addUserNotification(db,{discordUserId:playerId,type:r.status==="approved"?"farm_report_approved":"farm_report_rejected",title:r.status==="approved"?"Фарм-звіт схвалено":"Фарм-звіт відхилено",message:`Фарм-звіт ${r.id}: ${r.status}`,entityType:"farm_report",entityId:r.id});
+        if(playerId&&playerId!==String(r.discordUserId||""))addUserNotification(db,{discordUserId:playerId,type:r.status==="approved"?"farm_report_approved":"farm_report_rejected",title:r.status==="approved"?"Фарм-звіт з вашою участю прийнято":"Фарм-звіт з вашою участю відхилено",message:`Фарм-звіт ${r.id} ${r.status==="approved"?"прийнято":"відхилено"}.`,entityType:"farm_report",entityId:r.id});
       }
       await writeDbAsync(db);
       if(typeof addLog === "function") addLog("Farm-звіт перевірено", {id:r.id,status:r.status,by:interaction.user.id});

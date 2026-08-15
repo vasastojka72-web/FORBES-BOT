@@ -638,18 +638,14 @@ app.get("/api/launcher/notifications", protect, requireForbesMembership, async (
     createdAt: item.createdAt || new Date(0).toISOString(),
     readAt: null
   })); */
-  const preferences=userNotificationPreferences(db,discordUserId);
   notifications = [...notifications, ...announcements]
-    .filter(item=>{
-      const key=notificationPreferenceKey(item.type);
-      return !key || preferences[key]!==false;
-    })
     .sort((a,b)=>Date.parse(b.createdAt)-Date.parse(a.createdAt));
   if(since){
     const sinceTime = Date.parse(since);
     if(Number.isFinite(sinceTime)) notifications = notifications.filter(item => Date.parse(item.createdAt) > sinceTime);
   }
   notifications = notifications.slice(0, limit);
+  console.log("[LAUNCHER NOTIFICATIONS]",{discordUserId,memberId:currentMember?.memberId||"",stored:(db.notifications||[]).length,returned:notifications.length});
   res.json({ok:true,notifications,unread:notifications.filter(item=>!item.readAt).length,serverTime:new Date().toISOString()});
 });
 
@@ -1721,8 +1717,9 @@ app.post("/api/farm-reports/:id/status", protect, async (req,res)=>{
       entityId: report.id
     });
     for(const player of (report.players||[])){
-      const playerId=String(player?.discordUserId||player?.userId||"");
-      if(playerId&&playerId!==String(report.discordUserId||""))addUserNotification(db,{discordUserId:playerId,type:status==="approved"?"farm_report_approved":"farm_report_rejected",title:status==="approved"?"Фарм-звіт з вашою участю прийнято":"Фарм-звіт з вашою участю відхилено",message:`Фарм-звіт ${report.id} ${status==="approved"?"прийнято":"відхилено"}.`,entityType:"farm_report",entityId:report.id});
+      const playerMember=findCentralMember(db,player||{});
+      const playerId=String(playerMember?.discordUserId||player?.discordUserId||player?.userId||"");
+      if((playerMember?.memberId||playerId)&&playerId!==String(report.discordUserId||""))addUserNotification(db,{recipientMemberId:playerMember?.memberId||player?.memberId,discordUserId:playerId,type:status==="approved"?"farm_report_approved":"farm_report_rejected",title:status==="approved"?"Фарм-звіт з вашою участю прийнято":"Фарм-звіт з вашою участю відхилено",message:`Фарм-звіт ${report.id} ${status==="approved"?"прийнято":"відхилено"}.`,entityType:"farm_report",entityId:report.id});
     }
     writeDb(db);
 
@@ -3017,8 +3014,9 @@ client.on("interactionCreate", async interaction=>{
         entityId: r.id
       });
       for(const player of (r.players||[])){
-        const playerId=String(player?.discordUserId||player?.userId||"");
-        if(playerId&&playerId!==String(r.discordUserId||""))addUserNotification(db,{discordUserId:playerId,type:r.status==="approved"?"farm_report_approved":"farm_report_rejected",title:r.status==="approved"?"Фарм-звіт з вашою участю прийнято":"Фарм-звіт з вашою участю відхилено",message:`Фарм-звіт ${r.id} ${r.status==="approved"?"прийнято":"відхилено"}.`,entityType:"farm_report",entityId:r.id});
+        const playerMember=findCentralMember(db,player||{});
+        const playerId=String(playerMember?.discordUserId||player?.discordUserId||player?.userId||"");
+        if((playerMember?.memberId||playerId)&&playerId!==String(r.discordUserId||""))addUserNotification(db,{recipientMemberId:playerMember?.memberId||player?.memberId,discordUserId:playerId,type:r.status==="approved"?"farm_report_approved":"farm_report_rejected",title:r.status==="approved"?"Фарм-звіт з вашою участю прийнято":"Фарм-звіт з вашою участю відхилено",message:`Фарм-звіт ${r.id} ${r.status==="approved"?"прийнято":"відхилено"}.`,entityType:"farm_report",entityId:r.id});
       }
       await writeDbAsync(db);
       if(typeof addLog === "function") addLog("Farm-звіт перевірено", {id:r.id,status:r.status,by:interaction.user.id});
@@ -3079,6 +3077,7 @@ client.on("interactionCreate", async interaction=>{
       }
 
       addUserNotification(db,{
+        recipientMemberId:p.targetMemberId||original?.targetMemberId,
         discordUserId:p.discordUserId||original?.discordUserId,
         type:p.status==="approved"?"warning_payment_approved":"warning_payment_rejected",
         title:p.status==="approved"?"Зняття догани схвалено":"Зняття догани відхилено",
@@ -3117,6 +3116,7 @@ client.on("interactionCreate", async interaction=>{
       }
 
       addUserNotification(db,{
+        recipientMemberId:p.targetMemberId||original?.targetMemberId,
         discordUserId:p.discordUserId||original?.discordUserId,
         type:p.status==="paid"?"fine_payment_approved":"fine_payment_rejected",
         title:p.status==="paid"?"Оплату штрафу схвалено":"Оплату штрафу відхилено",

@@ -4981,6 +4981,20 @@ app.get("/api/members-autofill", async (req,res)=>{
         const dto=publicCentralMember(central);
         if(dto.nick&&dto.staticId)map.set("member:"+dto.memberId,dto);
       }
+
+      // Backfill older applications that were created before memberId became
+      // mandatory. The Discord user must still be in the guild, so stale
+      // applications cannot re-add someone who has already left FORBES.
+      for(const application of (Array.isArray(db.applications)?db.applications:[])){
+        const discordId=normalizeDiscordUserId(application.discordUserId||application.userId);
+        const gameId=normalizeGameId(application.staticId||application.playerId||application.gameId);
+        const nickname=normalizeMemberNickname(application.nickname||application.nick);
+        if(!discordId||!activeDiscordIds.has(discordId)||!gameId||!nickname)continue;
+        const central=upsertCentralMember(db,{discordUserId:discordId,gameId,nickname});
+        if(!application.memberId)application.memberId=central.memberId;
+        const dto=publicCentralMember(central);
+        map.set("member:"+dto.memberId,dto);
+      }
     }catch(e){
       console.warn("members-autofill discord source failed", e?.message || e);
     }

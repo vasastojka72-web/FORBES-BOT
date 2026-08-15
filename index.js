@@ -1055,8 +1055,15 @@ async function getPublicMembersFromDiscord(){
       .map(([,value])=>String(value)));
     return Array.from(collection.values())
       .filter(m=>!m.user?.bot)
-      .filter(m=>String(m.id)===String(CONFIG.ownerId||"") ||
-        Array.from(m.roles?.cache?.keys?.() || []).some(roleId=>familyRoleIds.has(String(roleId))))
+      .filter(m=>{
+        if(String(m.id)===String(CONFIG.ownerId||""))return true;
+        if(Array.from(m.roles?.cache?.keys?.() || []).some(roleId=>familyRoleIds.has(String(roleId))))return true;
+        // A FORBES game nickname always contains the numeric Game ID. This keeps
+        // newly authorised members visible even when a Discord role was renamed
+        // or recreated and its configured role ID has not been updated yet.
+        const display=m.displayName||m.nickname||m.user?.username||"";
+        return Boolean(parseForbesStaticNickFinal(display).staticId);
+      })
       .map(m=>{
         const display = m.displayName || m.nickname || m.user?.username || "Unknown";
         const parsed = parseForbesStaticNickFinal(display);
@@ -4949,12 +4956,30 @@ app.get("/api/members-autofill", async (req,res)=>{
     const db=readDb();
 
     // 1) Discord members
+    let activeDiscordIds=new Set();
     try{
       const discordMembers = await getPublicMembersFromDiscord();
       for(const m of discordMembers || []){
+        const discordId=normalizeDiscordUserId(m.discordUserId||m.discordId||m.userId);
+        if(discordId)activeDiscordIds.add(discordId);
         const saved=upsertCentralMember(db,m); saved.roles=m.roles||[];
         const dto=publicCentralMember(saved);
         map.set("member:"+dto.memberId,dto);
+      }
+
+      // The application form stores the verified game nickname and Game ID in
+      // the central member record. Merge those records only for people who are
+      // still present in Discord, so an application can immediately become an
+      // autocomplete option without resurrecting former members.
+      const guildId=CONFIG.guildId||process.env.GUILD_ID||process.env.DISCORD_GUILD_ID||CONFIG.serverId;
+      const guild=guildId?await client.guilds.fetch(guildId).catch(()=>null):client.guilds.cache.first();
+      const fetched=guild?await guild.members.fetch().catch(()=>null):null;
+      if(fetched)activeDiscordIds=new Set(Array.from(fetched.values()).filter(m=>!m.user?.bot).map(m=>String(m.id)));
+      for(const central of ensureCentralMembers(db)){
+        const discordId=normalizeDiscordUserId(central.discordUserId||central.discord_user_id);
+        if(!discordId||!activeDiscordIds.has(discordId))continue;
+        const dto=publicCentralMember(central);
+        if(dto.nick&&dto.staticId)map.set("member:"+dto.memberId,dto);
       }
     }catch(e){
       console.warn("members-autofill discord source failed", e?.message || e);
@@ -5162,7 +5187,11 @@ function forbes2026RoleNames(member){
   try{ if(member?.roles?.cache) return Array.from(member.roles.cache.values()).map(r=>String(r?.name||"").toLowerCase()); if(Array.isArray(member?.roles)) return member.roles.map(r=>String(r?.name||r||"").toLowerCase()); }catch(e){} return [];
 }
 function forbes2026HasId(member, ids){ const have=forbes2026RoleIds(member); return (ids||[]).map(String).some(id=>have.includes(id)); }
-function forbes2026HasName(member,names){ const have=forbes2026RoleNames(member); return have.some(r=>names.some(n=>r===String(n).toLowerCase())); }
+function forbes2026HasName(member,names){
+  const norm=value=>String(value||"").toLowerCase().replace(/[^\p{L}\p{N}]+/gu," ").trim();
+  const have=forbes2026RoleNames(member).map(norm), want=(names||[]).map(norm);
+  return have.some(role=>want.some(name=>role===name||role.includes(name)));
+}
 function forbes2026Main(req){ try{ if(typeof _mainId==='function'&&_mainId(req))return true; if(typeof forbesMainIdFromReq==='function'&&forbesMainIdFromReq(req))return true; }catch(e){} return false; }
 function forbes2026Full(member,req){ return forbes2026Main(req)||forbes2026HasId(member,[FORBES_ACCESS_ROLE_IDS_2026.leader2,FORBES_ACCESS_ROLE_IDS_2026.deputy])||forbes2026HasName(member,['лідер','лідер 2','зам лідера']); }
 function forbes2026Farm(member,req){ return forbes2026Full(member,req)||forbes2026HasId(member,[FORBES_ACCESS_ROLE_IDS_2026.farmManager])||forbes2026HasName(member,['фарм менеджер','старший каптер']); }

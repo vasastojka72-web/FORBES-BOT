@@ -358,11 +358,21 @@ app.get("/api/presence/live", async(req,res)=>{
 
 app.post("/api/launcher/afk/toggle", protect, requireForbesMembership, async (req,res)=>{
   const userId=String(req.user?.id||"");
-  const afkChannelId=String(process.env.DISCORD_AFK_CHANNEL_ID||"");
   if(!userId)return res.status(401).json({ok:false,error:"AUTH_REQUIRED"});
-  if(!afkChannelId)return res.status(503).json({ok:false,error:"AFK_CHANNEL_NOT_CONFIGURED"});
   try{
     const guild=await client.guilds.fetch(CONFIG.guildId);
+    const configuredAfkId=String(process.env.DISCORD_AFK_CHANNEL_ID||guild.afkChannelId||"");
+    let afkChannel=configuredAfkId?await guild.channels.fetch(configuredAfkId).catch(()=>null):null;
+    if(!afkChannel||!afkChannel.isVoiceBased()){
+      const channels=await guild.channels.fetch().catch(()=>guild.channels.cache);
+      afkChannel=Array.from(channels.values()).find(channel=>{
+        if(!channel?.isVoiceBased?.())return false;
+        const name=String(channel.name||"").toLowerCase().replace(/[^\p{L}\p{N}]+/gu," ").trim();
+        return /(^| )(afk|афк)( |$)/i.test(name);
+      })||null;
+    }
+    if(!afkChannel||!afkChannel.isVoiceBased())return res.status(503).json({ok:false,error:"AFK_CHANNEL_NOT_CONFIGURED"});
+    const afkChannelId=String(afkChannel.id);
     const member=await guild.members.fetch(userId);
     const currentId=String(member.voice?.channelId||"");
     const db=readDb();
@@ -391,8 +401,6 @@ app.post("/api/launcher/afk/toggle", protect, requireForbesMembership, async (re
 
     if(!currentId)return res.status(409).json({ok:false,error:"USER_NOT_IN_VOICE"});
     if(currentId===afkChannelId)return res.status(409).json({ok:false,error:"USER_NOT_IN_AFK"});
-    const afkChannel=await guild.channels.fetch(afkChannelId).catch(()=>null);
-    if(!afkChannel||!afkChannel.isVoiceBased())return res.status(503).json({ok:false,error:"AFK_CHANNEL_NOT_CONFIGURED"});
     db.afkSessions[userId]={previousVoiceChannelId:currentId,createdAt:new Date().toISOString()};
     await writeDbAsync(db);
     try{

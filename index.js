@@ -231,6 +231,20 @@ function notificationPreferenceKey(type){
   if(value==="announcement")return "announcements";
   return "";
 }
+function launcherNotificationDto(item={}){
+  return {
+    ...item,
+    id:String(item.id||""),
+    type:String(item.type||"system"),
+    title:String(item.title||"FORBES Launcher"),
+    message:String(item.message||""),
+    createdAt:String(item.createdAt||""),
+    author:String(item.author||item.authorName||"FORBES"),
+    priority:String(item.priority||"normal"),
+    readAt:item.readAt?String(item.readAt):"",
+    isRead:Boolean(item.readAt||item.isRead||item.read)
+  };
+}
 function userNotificationPreferences(db,userId){
   const saved=db.notificationPreferences?.[String(userId)]||{};
   return {...DEFAULT_NOTIFICATION_PREFERENCES,...saved};
@@ -644,7 +658,7 @@ app.get("/api/launcher/notifications", protect, requireForbesMembership, async (
     const sinceTime = Date.parse(since);
     if(Number.isFinite(sinceTime)) notifications = notifications.filter(item => Date.parse(item.createdAt) > sinceTime);
   }
-  notifications = notifications.slice(0, limit);
+  notifications = notifications.slice(0, limit).map(launcherNotificationDto);
   console.log("[LAUNCHER NOTIFICATIONS]",{discordUserId,memberId:currentMember?.memberId||"",stored:(db.notifications||[]).length,returned:notifications.length});
   res.json({ok:true,notifications,unread:notifications.filter(item=>!item.readAt).length,serverTime:new Date().toISOString()});
 });
@@ -801,7 +815,7 @@ app.get("/api/launcher/announcements",protect,requireForbesMembership,async(req,
     const target=String(item.targetType||"ALL").toUpperCase();
     return target==="ALL"||(target==="ROLES"&&(item.targetRoleIds||[]).some(role=>roles.has(String(role))));
   }).sort((a,b)=>Date.parse(b.createdAt||0)-Date.parse(a.createdAt||0)).slice(0,limit)
-    .map(item=>({...item,message:item.message||item.text||"",readAt:reads.has(String(item.id))?"read":null}));
+    .map(item=>launcherNotificationDto({...item,message:item.message||item.text||"",readAt:reads.has(String(item.id))?"read":""}));
   res.json({ok:true,announcements,unread:announcements.filter(item=>!item.readAt).length,serverTime:new Date().toISOString()});
 });
 
@@ -2120,7 +2134,7 @@ app.post("/api/fines", protect, async (req,res)=>{
       discordUserId: item.discordUserId,
       type: "fine_created",
       title: "Новий штраф",
-      message: `${item.reason || "Без причини"}. Сума: ${money(item.amount)}.`,
+      message: `Вам видали штраф. Видав: ${item.createdBy || "FORBES"}. Причина: ${item.reason || "Без причини"}. Сума: ${money(item.amount)}. Фото доказів дивіться в Discord.`,
       entityType: "fine",
       entityId: item.id
     });
@@ -2225,7 +2239,7 @@ app.post("/api/warnings", protect, async (req,res)=>{
       discordUserId: item.discordUserId,
       type: "warning_created",
       title: "Нова догана",
-      message: item.reason || "Причину не вказано.",
+      message: `Вам видали догану. Видав: ${item.createdBy || "FORBES"}. Причина: ${item.reason || "Причину не вказано"}. Фото доказів дивіться в Discord.`,
       entityType: "warning",
       entityId: item.id
     });

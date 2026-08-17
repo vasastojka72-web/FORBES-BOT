@@ -610,6 +610,7 @@ app.get("/api/launcher/notifications", protect, requireForbesMembership, async (
   const since = String(req.query.since || "");
   const db = readDb();
   const currentMember=findCentralMember(db,{discordUserId});
+  const currentRoleIds=new Set(await currentLauncherRoleIds(req));
   const belongsToCurrent=item=>{
     if(String(item?.recipientMemberId||item?.memberId||item?.targetMemberId||"")===String(currentMember?.memberId||" "))return true;
     if(String(item?.discordUserId||item?.recipientDiscordUserId||item?.userId||"")===discordUserId)return true;
@@ -645,11 +646,15 @@ app.get("/api/launcher/notifications", protect, requireForbesMembership, async (
   if((db.notifications||[]).length!==beforeMaterialize) await writeDbAsync(db);
   let notifications = (Array.isArray(db.notifications) ? db.notifications : [])
     .filter(belongsToCurrent);
-  /* Personal notifications and announcements are intentionally separate feeds.
-     Keep this legacy mapper disabled so announcement unread state cannot pollute
-     the personal badge. */
-  const announcements = [];
-  /* (Array.isArray(db.announcements) ? db.announcements : []).map(item => ({
+  // Site announcements belong in the regular Launcher notification feed.
+  // Messages from seniors remain in the separate "Від старших" feed.
+  const announcementReads=new Set(Array.isArray(db.announcementReads?.[discordUserId])?db.announcementReads[discordUserId]:[]);
+  const announcements = (Array.isArray(db.announcements) ? db.announcements : [])
+    .filter(item=>String(item.kind||"").toLowerCase()==="announcement"||String(item.type||"").toLowerCase()==="announcement")
+    .filter(item=>{
+      const target=String(item.targetType||"ALL").toUpperCase();
+      return target==="ALL"||(target==="ROLES"&&(item.targetRoleIds||[]).some(role=>currentRoleIds.has(String(role))));
+    }).map(item => ({
     id: `announcement:${item.id}`,
     discordUserId,
     type: "announcement",
@@ -658,8 +663,8 @@ app.get("/api/launcher/notifications", protect, requireForbesMembership, async (
     entityType: "announcement",
     entityId: String(item.id || ""),
     createdAt: item.createdAt || new Date(0).toISOString(),
-    readAt: null
-  })); */
+    readAt: announcementReads.has(String(item.id))?"read":""
+  }));
   notifications = [...notifications, ...announcements]
     .sort((a,b)=>Date.parse(b.createdAt)-Date.parse(a.createdAt));
   if(since){
@@ -761,6 +766,15 @@ app.post("/api/launcher/notifications/:id/read", protect, requireForbesMembershi
   const discordUserId = String(req.user?.id || "");
   if(!discordUserId || req.user?.guest) return res.status(401).json({ok:false,error:"auth_required"});
   const db = readDb();
+  const requestedId=String(req.params.id||"");
+  if(requestedId.startsWith("announcement:")){
+    const announcementId=requestedId.slice("announcement:".length);
+    if(!(db.announcements||[]).some(x=>String(x.id)===announcementId))return res.status(404).json({ok:false,error:"notification_not_found"});
+    db.announcementReads=db.announcementReads||{};
+    const reads=new Set(Array.isArray(db.announcementReads[discordUserId])?db.announcementReads[discordUserId]:[]);
+    reads.add(announcementId); db.announcementReads[discordUserId]=[...reads].slice(-2000);
+    await writeDbAsync(db); return res.json({ok:true,id:requestedId});
+  }
   const currentMember=findCentralMember(db,{discordUserId});
   const item = (Array.isArray(db.notifications) ? db.notifications : [])
     .find(entry => String(entry.id) === String(req.params.id) && (String(entry.recipientMemberId||"")===String(currentMember?.memberId||" ")||String(entry.discordUserId)===discordUserId));
@@ -797,6 +811,15 @@ app.patch("/api/launcher/notifications/:id/read", protect, requireForbesMembersh
   const userId=String(req.user?.id||"");
   if(!userId||req.user?.guest)return res.status(401).json({ok:false,error:"auth_required"});
   const db=readDb();
+  const requestedId=String(req.params.id||"");
+  if(requestedId.startsWith("announcement:")){
+    const announcementId=requestedId.slice("announcement:".length);
+    if(!(db.announcements||[]).some(x=>String(x.id)===announcementId))return res.status(404).json({ok:false,error:"notification_not_found"});
+    db.announcementReads=db.announcementReads||{};
+    const reads=new Set(Array.isArray(db.announcementReads[userId])?db.announcementReads[userId]:[]);
+    reads.add(announcementId); db.announcementReads[userId]=[...reads].slice(-2000);
+    await writeDbAsync(db); return res.json({ok:true,id:requestedId});
+  }
   const currentMember=findCentralMember(db,{discordUserId:userId});
   const item=(db.notifications||[]).find(x=>String(x.id)===String(req.params.id)&&(String(x.recipientMemberId||"")===String(currentMember?.memberId||" ")||String(x.discordUserId)===userId));
   if(!item)return res.status(404).json({ok:false,error:"notification_not_found"});
@@ -819,7 +842,9 @@ app.get("/api/launcher/announcements",protect,requireForbesMembership,async(req,
   const db=readDb(), roles=new Set(await currentLauncherRoleIds(req));
   const reads=new Set(Array.isArray(db.announcementReads?.[userId])?db.announcementReads[userId]:[]);
   const limit=Math.min(Math.max(Number(req.query.limit||50),1),100);
-  const announcements=(db.announcements||[]).filter(item=>{
+  const announcements=(db.announcements||[])
+  .filter(item=>String(item.kind||"senior").toLowerCase()!=="announcement"&&String(item.type||"").toLowerCase()!=="announcement")
+  .filter(item=>{
     const target=String(item.targetType||"ALL").toUpperCase();
     return target==="ALL"||(target==="ROLES"&&(item.targetRoleIds||[]).some(role=>roles.has(String(role))));
   }).sort((a,b)=>Date.parse(b.createdAt||0)-Date.parse(a.createdAt||0)).slice(0,limit)
@@ -2189,9 +2214,6 @@ app.post("/api/fines", protect, async (req,res)=>{
 });
 app.post("/api/fine-payments", protect, async (req,res)=>{
   const member = await requireFamilyRole(req, res); if(!member) return;
-
-  /* FORBES_DISC_ALL_PATCH */
-  if(member && !canDisciplineAll(member, req)) return denyPerm(res,"Недостатньо прав для штрафів/доган.");
   const db=readDb();
   const original = (db.fines || []).find(f => f.id === String(req.body.fineId||""));
   let centralTarget=findCentralMember(db,{memberId:original?.targetMemberId,...req.body});
@@ -2366,6 +2388,8 @@ app.delete("/api/warnings/:id", protect, async (req,res)=>{
 
 app.post("/api/fines/:id/remind", protect, async (req,res)=>{
   try{
+    const member=await requireFamilyRole(req,res); if(!member)return;
+    if(!canDisciplineAll(member,req)) return denyPerm(res,"Недостатньо прав для штрафів/доган.");
     const db = readDb();
     const f = (db.fines || []).find(x => x.id === req.params.id);
     if(!f) return res.status(404).json({ok:false,error:"fine_not_found"});
@@ -2391,6 +2415,8 @@ app.post("/api/fines/:id/remind", protect, async (req,res)=>{
 
 app.post("/api/fines/:id/paid", protect, async (req,res)=>{
   try{
+    const member=await requireFamilyRole(req,res); if(!member)return;
+    if(!canDisciplineAll(member,req)) return denyPerm(res,"Недостатньо прав для штрафів/доган.");
     const db = readDb();
     const f = (db.fines || []).find(x => x.id === req.params.id);
     if(!f) return res.status(404).json({ok:false,error:"fine_not_found"});
@@ -2415,6 +2441,8 @@ app.post("/api/fines/:id/paid", protect, async (req,res)=>{
 
 app.post("/api/fines/:id/close", protect, async (req,res)=>{
   try{
+    const member=await requireFamilyRole(req,res); if(!member)return;
+    if(!canDisciplineAll(member,req)) return denyPerm(res,"Недостатньо прав для штрафів/доган.");
     const db = readDb();
     const f = (db.fines || []).find(x => x.id === req.params.id);
     if(!f) return res.status(404).json({ok:false,error:"fine_not_found"});
@@ -2430,6 +2458,8 @@ app.post("/api/fines/:id/close", protect, async (req,res)=>{
 });
 app.post("/api/warnings/:id/remind", protect, async (req,res)=>{
   try{
+    const member=await requireFamilyRole(req,res); if(!member)return;
+    if(!canDisciplineAll(member,req)) return denyPerm(res,"Недостатньо прав для штрафів/доган.");
     const db = readDb();
     const w = (db.warnings || []).find(x => x.id === req.params.id);
     if(!w) return res.status(404).json({ok:false,error:"warning_not_found"});
@@ -2454,6 +2484,8 @@ app.post("/api/warnings/:id/remind", protect, async (req,res)=>{
 
 app.post("/api/warnings/:id/close", protect, async (req,res)=>{
   try{
+    const member=await requireFamilyRole(req,res); if(!member)return;
+    if(!canDisciplineAll(member,req)) return denyPerm(res,"Недостатньо прав для штрафів/доган.");
     const db = readDb();
     const w = (db.warnings || []).find(x => x.id === req.params.id);
     if(!w) return res.status(404).json({ok:false,error:"warning_not_found"});
@@ -4375,21 +4407,28 @@ async function sendForbesCalendarCopy(title, description){
 app.post("/api/announcements", protect, async (req,res)=>{
   try{
     const member=await apiMemberFromRequest(req);
+    const messageKind=String(req.body.kind||"senior").trim().toLowerCase();
     const category=String(req.body.category||req.body.type||"all").trim().toLowerCase();
+    if(!["senior","announcement"].includes(messageKind)) return res.status(400).json({ok:false,error:"bad_kind"});
     if(!["all","farm","capt"].includes(category)) return res.status(400).json({ok:false,error:"bad_category"});
+    if(messageKind==="announcement"&&category==="capt") return res.status(400).json({ok:false,error:"capt_announcement_channel_not_configured"});
     if(!(forbes2026Farm(member,req)||forbes2026Capt(member,req))) return res.status(403).json({ok:false,error:"no_permission"});
 
-    const categories={
+    const seniorCategories={
       all:{title:"👥 Повідомлення для всіх",label:"Для всіх",channelId:CONFIG.channels.generalChat,targetType:"ALL",roleIds:[]},
       farm:{title:"🌾 Повідомлення для фарму",label:"Фарм",channelId:CONFIG.channels.seniorFarmMessages,targetType:"ROLES",roleIds:[CONFIG.roles.farmer,CONFIG.roles.farmManager].map(String).filter(Boolean)},
       capt:{title:"⚔️ Повідомлення для капту",label:"Капт",channelId:CONFIG.channels.seniorCaptMessages,targetType:"ROLES",roleIds:[CONFIG.roles.capt,CONFIG.roles.seniorCapt].map(String).filter(Boolean)}
     };
-    const selected=categories[category];
+    const announcementCategories={
+      all:{title:"📢 Загальне оголошення",label:"Загальне",channelId:CONFIG.channels.announcements,targetType:"ALL",roleIds:[]},
+      farm:{title:"🌾 Оголошення для фарму",label:"Фарм",channelId:CONFIG.channels.farmAnnouncements,targetType:"ROLES",roleIds:[CONFIG.roles.farmer,CONFIG.roles.farmManager].map(String).filter(Boolean)}
+    };
+    const selected=(messageKind==="announcement"?announcementCategories:seniorCategories)[category];
     const text=String(req.body.text||req.body.message||"").trim();
     if(!text) return res.status(400).json({ok:false,error:"empty_text"});
     const author=member?.displayName||member?.user?.globalName||member?.user?.username||req.user?.global_name||req.user?.username||"FORBES";
     const item={
-      id:id("ann"),type:"senior_message",category,categoryLabel:selected.label,title:selected.title,
+      id:id("ann"),type:messageKind==="announcement"?"announcement":"senior_message",kind:messageKind,category,categoryLabel:selected.label,title:selected.title,
       text,message:text,targetType:selected.targetType,targetRoleIds:selected.roleIds,priority:"normal",
       delivery:{discord:true,launcher:true,windows:true},createdAt:new Date().toISOString(),
       createdBy:String(req.user?.id||member?.id||""),author,authorName:author
@@ -4416,7 +4455,7 @@ app.post("/api/announcements", protect, async (req,res)=>{
       discordError=error?.message||String(error);
       console.error("Senior message Discord send failed:",error);
     }
-    res.json({ok:true,item,announcement:item,discordSent,discordError,discordChannelId:selected.channelId,launcherQueued:true,windowsQueued:true});
+    res.json({ok:true,item,announcement:item,kind:messageKind,discordSent,discordError,discordChannelId:selected.channelId,launcherQueued:true,windowsQueued:true});
   }catch(error){
     console.error("POST /api/announcements failed:",error);
     res.status(500).json({ok:false,error:"announcement_create_failed",message:error?.message||String(error)});
@@ -5215,9 +5254,9 @@ function forbes2026HasName(member,names){
   return have.some(role=>want.some(name=>role===name||role.includes(name)));
 }
 function forbes2026Main(req){ try{ if(typeof _mainId==='function'&&_mainId(req))return true; if(typeof forbesMainIdFromReq==='function'&&forbesMainIdFromReq(req))return true; }catch(e){} return false; }
-function forbes2026Full(member,req){ return forbes2026Main(req)||forbes2026HasId(member,[FORBES_ACCESS_ROLE_IDS_2026.leader2,FORBES_ACCESS_ROLE_IDS_2026.deputy])||forbes2026HasName(member,['лідер','лідер 2','зам лідера']); }
-function forbes2026Farm(member,req){ return forbes2026Full(member,req)||forbes2026HasId(member,[FORBES_ACCESS_ROLE_IDS_2026.farmManager])||forbes2026HasName(member,['фарм менеджер','старший каптер']); }
-function forbes2026Capt(member,req){ return forbes2026Full(member,req)||forbes2026HasId(member,[FORBES_ACCESS_ROLE_IDS_2026.seniorCapt,CONFIG.roles.seniorCapt])||forbes2026HasName(member,['старший каптер']); }
+function forbes2026Full(member,req){ return forbes2026Main(req)||forbes2026HasId(member,[FORBES_ACCESS_ROLE_IDS_2026.leader2,FORBES_ACCESS_ROLE_IDS_2026.deputy]); }
+function forbes2026Farm(member,req){ return forbes2026Full(member,req)||forbes2026HasId(member,[FORBES_ACCESS_ROLE_IDS_2026.farmManager]); }
+function forbes2026Capt(member,req){ return forbes2026Full(member,req)||forbes2026HasId(member,[FORBES_ACCESS_ROLE_IDS_2026.seniorCapt,CONFIG.roles.seniorCapt]); }
 function forbes2026Discipline(member,req){ return forbes2026Farm(member,req)||forbes2026Capt(member,req); }
 function forbes2026Complaints(member,req){ return forbes2026Full(member,req)||forbes2026HasId(member,[FORBES_ACCESS_ROLE_IDS_2026.complaintAdmin])||forbes2026HasName(member,['адміністратор скарг']); }
 

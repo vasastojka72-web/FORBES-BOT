@@ -5010,7 +5010,16 @@ app.get("/api/members-autofill", async (req,res)=>{
         const discordId=normalizeDiscordUserId(m.discordUserId||m.discordId||m.userId);
         if(discordId)activeDiscordIds.add(discordId);
         const saved=upsertCentralMember(db,m); saved.roles=m.roles||[];
-        const dto=publicCentralMember(saved);
+        // Discord is the live source for the visible nickname/Game ID. Keep the
+        // stable central member relation, but never let an old application or
+        // cached central value replace the current server nickname.
+        const dto={
+          ...publicCentralMember(saved),
+          nick:normalizeMemberNickname(m.nick||m.nickname||saved.gameNickname),
+          nickname:normalizeMemberNickname(m.nick||m.nickname||saved.gameNickname),
+          staticId:normalizeGameId(m.staticId||m.playerId||saved.gameId),
+          playerId:normalizeGameId(m.staticId||m.playerId||saved.gameId)
+        };
         map.set("member:"+dto.memberId,dto);
       }
 
@@ -5026,7 +5035,8 @@ app.get("/api/members-autofill", async (req,res)=>{
         const discordId=normalizeDiscordUserId(central.discordUserId||central.discord_user_id);
         if(!discordId||!activeDiscordIds.has(discordId))continue;
         const dto=publicCentralMember(central);
-        if(dto.nick&&dto.staticId)map.set("member:"+dto.memberId,dto);
+        const key="member:"+dto.memberId;
+        if(dto.nick&&dto.staticId&&!map.has(key))map.set(key,dto);
       }
 
       // Backfill older applications that were created before memberId became
@@ -5037,10 +5047,14 @@ app.get("/api/members-autofill", async (req,res)=>{
         const gameId=normalizeGameId(application.staticId||application.playerId||application.gameId);
         const nickname=normalizeMemberNickname(application.nickname||application.nick);
         if(!discordId||!activeDiscordIds.has(discordId)||!gameId||!nickname)continue;
-        const central=upsertCentralMember(db,{discordUserId:discordId,gameId,nickname});
+        // Applications are a fallback only. If Discord already has a central
+        // member, an old application must not roll their renamed nickname back.
+        const existing=findCentralMember(db,{discordUserId:discordId});
+        const central=existing||upsertCentralMember(db,{discordUserId:discordId,gameId,nickname});
         if(!application.memberId)application.memberId=central.memberId;
         const dto=publicCentralMember(central);
-        map.set("member:"+dto.memberId,dto);
+        const key="member:"+dto.memberId;
+        if(!map.has(key))map.set(key,dto);
       }
     }catch(e){
       console.warn("members-autofill discord source failed", e?.message || e);

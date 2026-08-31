@@ -1,6 +1,7 @@
 const COMPLAINT_ADMIN_ROLE_ID='1527167132696313866';
 import "dotenv/config";
 import express from "express";
+import { createServer } from "node:http";
 import { Readable } from "node:stream";
 import crypto from "node:crypto";
 import cors from "cors";
@@ -9,12 +10,14 @@ import { Client, GatewayIntentBits, Partials, EmbedBuilder, AttachmentBuilder, A
 import { CONFIG } from "./config.js";
 import {readDb, writeDb, writeDbAsync, id, initDb, getDbInfo} from "./storage.js";
 import {ensureMediaSystem, uploadBase64Media, deleteMedia, getMediaPublicUrl, MEDIA_PATHS, mediaConfigured, downloadMedia} from "./media-storage.js";
+import { createDanceSyncManager } from "./dance-sync.js";
 
 
 process.on("unhandledRejection", (err)=>console.error("UNHANDLED REJECTION:", err));
 process.on("uncaughtException", (err)=>console.error("UNCAUGHT EXCEPTION:", err));
 
 const app = express();
+const server = createServer(app);
 const PORT = Number(process.env.PORT || 10000);
 const SITE_ORIGIN = process.env.SITE_ORIGIN || "https://fluffy-madeleine-c15914.netlify.app";
 const API_SECRET = process.env.API_SECRET || "";
@@ -264,6 +267,10 @@ function protect(req, res, next){
   }
   return res.status(401).json({ok:false,error:"auth_required",message:"Увійдіть через Discord, щоб виконати цю дію."});
 }
+
+const danceSyncManager=createDanceSyncManager({verifyToken:verifyAuthToken,logger:console});
+danceSyncManager.attach(server);
+app.get('/api/dance-sync/status',protect,requireLauncherSession,(req,res)=>res.json({ok:true,...danceSyncManager.status()}));
 
 function requireLauncherSession(req,res,next){
   if(!req.user?.id||req.user?.guest)return res.status(401).json({ok:false,error:"AUTH_REQUIRED",message:"Потрібна повторна авторизація Discord."});
@@ -2955,6 +2962,24 @@ async function reviewButtonError(interaction, text="❌ Помилка обро�
   return interaction.reply({content:text, ephemeral:true}).catch(()=>{});
 }
 
+function reviewButtonFailureText(error, entityLabel="Запит"){
+  const code=String(error?.code||error?.rawError?.code||"");
+  const message=String(error?.message||error?.rawError?.message||"").toLowerCase();
+  if(code==="10062"||message.includes("unknown interaction")){
+    return "⌛ Час відповіді Discord на цю кнопку минув. Перевірте актуальний статус на сайті та, якщо він не змінився, обробіть звіт вручну.";
+  }
+  if(code==="40060"||message.includes("already been acknowledged")){
+    return "ℹ️ Discord уже прийняв цю дію. Оновіть канал і перевірте актуальний статус звіту на сайті.";
+  }
+  if(code==="10008"||message.includes("unknown message")){
+    return "❌ Повідомлення Discord уже видалене або недоступне. Обробіть звіт вручну на сайті.";
+  }
+  if(code==="50013"||message.includes("missing permissions")){
+    return "❌ Боту бракує прав для оновлення повідомлення в цьому каналі. Статус потрібно перевірити на сайті.";
+  }
+  return `❌ ${entityLabel} не вдалося обробити. Статус не підтверджено — перевірте його на сайті або повторіть дію.`;
+}
+
 async function finishReviewButton(interaction, payload){
   if(interaction.deferred || interaction.replied){
     return interaction.editReply(payload);
@@ -3060,6 +3085,7 @@ client.on("interactionCreate", async interaction=>{
 
       const r=db.farmReports.find(x=>x.id===itemId);
       if(!r) return reviewButtonError(interaction,"❌ Не знайдено звіт.");
+      if(r.status&&r.status!=="pending") return reviewButtonError(interaction,`ℹ️ Звіт уже оброблено: ${r.status==="approved"?"✅ одобрено":"❌ відхилено"}. Актуальний статус доступний на сайті.`);
       r.status=action==="farm_approve"?"approved":"rejected";
       r.reviewedBy=interaction.user.id;
       r.reviewedAt=now();
@@ -3206,7 +3232,7 @@ client.on("interactionCreate", async interaction=>{
 
   }catch(err){
     console.error("interaction button failed", interaction.customId, err);
-    await reviewButtonError(interaction,"❌ Помилка бота під час обробки кнопки. Спробуйте ще раз.");
+    await reviewButtonError(interaction,reviewButtonFailureText(err,"Кнопку"));
   }
 });
 
@@ -5412,9 +5438,10 @@ app.delete('/api/charge/reports/:id', protect, async(req,res)=>{
 });
 client.on('interactionCreate',async interaction=>{
   if(!interaction.isButton()||!String(interaction.customId).startsWith('charge_'))return;
+  const [action,reportId]=interaction.customId.split(':');
   try{
-    await deferReviewButton(interaction);
-    const [action,reportId]=interaction.customId.split(':');
+    const acknowledged=await deferReviewButton(interaction);
+    if(!acknowledged)return;
     const member=await interactionMember(interaction);
     if(!(String(interaction.user.id)===String(CONFIG.ownerId)||chargeIsStaff(member,null)))return denyNoPerm(interaction,'❌ Цю дію можуть виконувати тільки старший каптер, зам лідера, лідер 2, лідер або власник.');
     const map={charge_approve:'approved',charge_reject:'rejected',charge_fraud:'fraud'};
@@ -5428,11 +5455,23 @@ client.on('interactionCreate',async interaction=>{
     await finishReviewButton(interaction,await chargeReportPayload(r));
   }catch(e){
     console.error('charge button failed',interaction.customId,e);
-    await reviewButtonError(interaction,'❌ Помилка обробки кнопки звіту. Спробуйте ще раз.');
+    // The database write happens before the Discord message update. If only the
+    // message update failed, report the saved status instead of claiming that
+    // the whole review failed.
+    try{
+      const saved=chargeEnsureDb(readDb()).chargeReports.find(x=>String(x.id)===String(reportId));
+      if(saved&&saved.status&&saved.status!=='pending'){
+        await reviewButtonError(interaction,`✅ Статус звіту збережено: ${chargeStatusLabel(saved.status)}. Discord не зміг оновити старе повідомлення; актуальний статус уже є на сайті.`);
+        return;
+      }
+    }catch(readError){
+      console.error('charge button status recheck failed',interaction.customId,readError);
+    }
+    await reviewButtonError(interaction,reviewButtonFailureText(e,'Звіт'));
   }
 });
 
-app.listen(PORT, ()=>{
+server.listen(PORT, ()=>{
   console.log(`✅ API running on port ${PORT}`);
 });
 

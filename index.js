@@ -8,7 +8,7 @@ import cors from "cors";
 import cron from "node-cron";
 import { Client, GatewayIntentBits, Partials, EmbedBuilder, AttachmentBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, REST, Routes, SlashCommandBuilder } from "discord.js";
 import { CONFIG } from "./config.js";
-import {readDb, writeDb, writeDbAsync, id, initDb, getDbInfo} from "./storage.js";
+import {readDb, writeDb, writeDbAsync, id, initDb, getDbInfo, getStorageNetworkMetrics} from "./storage.js";
 import {ensureMediaSystem, uploadBase64Media, deleteMedia, getMediaPublicUrl, MEDIA_PATHS, mediaConfigured, downloadMedia} from "./media-storage.js";
 import { createDanceSyncManager } from "./dance-sync.js";
 
@@ -81,6 +81,34 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildPresences, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
   partials: [Partials.Channel, Partials.Message]
 });
+
+const outboundMetrics={
+  startedAt:new Date().toISOString(),
+  discordFullMemberFetches:0,
+  discordRosterCacheHits:0,
+  discordRosterCacheMisses:0,
+  discordRosterRequestsDeduplicated:0,
+  publicDashboardCalls:0,
+  membersPublicCalls:0,
+  membersAutofillCalls:0,
+  rosterDbWrites:0,
+  rosterDbWritesSkipped:0,
+  discordChannelRestFetches:0,
+  discordChannelCacheHits:0,
+  discordQueueSendAttempts:0
+};
+setInterval(()=>{
+  const storage=getStorageNetworkMetrics();
+  console.log("[NETWORK METRICS]",{
+    discordFullMemberFetches:outboundMetrics.discordFullMemberFetches,
+    rosterCacheHits:outboundMetrics.discordRosterCacheHits,
+    rosterCacheMisses:outboundMetrics.discordRosterCacheMisses,
+    rosterDbWrites:outboundMetrics.rosterDbWrites,
+    rosterDbWritesSkipped:outboundMetrics.rosterDbWritesSkipped,
+    supabaseFullDbWrites:storage.fullDbWrites,
+    estimatedSupabaseMB:Number((Number(storage.estimatedRequestBytes||0)/1024/1024).toFixed(3))
+  });
+},15*60*1000).unref();
 
 const money = n => `${Number(n || 0).toLocaleString("uk-UA")}$`;
 const now = () => new Date().toLocaleString("uk-UA", { timeZone: "Europe/Kyiv" });
@@ -429,7 +457,12 @@ function ownerOnly(req, res, next){
   if(!userId||String(userId)!==String(CONFIG.ownerId))return res.status(404).json({ok:false,error:"not_found"});
   next();
 }
-async function channel(id){ return client.channels.fetch(id).catch(()=>null); }
+async function channel(id){
+  const cached=client.channels.cache.get(String(id));
+  if(cached){outboundMetrics.discordChannelCacheHits++;return cached;}
+  outboundMetrics.discordChannelRestFetches++;
+  return client.channels.fetch(id).catch(()=>null);
+}
 function embed(title, description, color = 0xf1b83a){ return new EmbedBuilder().setTitle(title).setDescription(description).setColor(color).setFooter({text:"FORBES Family"}).setTimestamp(new Date()); }
 
 
@@ -1083,17 +1116,60 @@ function cleanForbesRolesFinal(member){
   }catch(e){ return []; }
 }
 
-async function getPublicMembersFromDiscord(){
+const DISCORD_ROSTER_CACHE_MS=Math.min(Math.max(Number(process.env.DISCORD_ROSTER_CACHE_SECONDS||300),60),900)*1000;
+let discordRosterCache={members:[],updatedAt:0};
+let discordRosterLoading=null;
+
+function invalidateDiscordRosterCache(){discordRosterCache.updatedAt=0;}
+client.on("guildMemberAdd",invalidateDiscordRosterCache);
+client.on("guildMemberRemove",invalidateDiscordRosterCache);
+client.on("guildMemberUpdate",invalidateDiscordRosterCache);
+
+function centralRosterFingerprint(members){
+  return JSON.stringify((members||[]).map(m=>({
+    memberId:String(m.memberId||m.member_id||m.id||""),
+    gameNickname:String(m.gameNickname||m.game_nickname||m.nickname||m.nick||""),
+    gameId:String(m.gameId||m.game_id||m.staticId||m.playerId||""),
+    discordUserId:String(m.discordUserId||m.discord_user_id||m.discordId||m.userId||""),
+    active:m.active!==false,
+    avatar:String(m.avatar||""),role:String(m.role||""),highestRoleName:String(m.highestRoleName||""),
+    roles:Array.isArray(m.roles)?m.roles.map(r=>({id:String(r?.id||""),name:String(r?.name||r||""),position:Number(r?.position||0)})):[]
+  })).sort((a,b)=>a.memberId.localeCompare(b.memberId)));
+}
+
+function mergeDiscordRosterIntoDb(db,discordMembers){
+  const original=JSON.parse(JSON.stringify(ensureCentralMembers(db)));
+  const before=centralRosterFingerprint(original);
+  const saved=(discordMembers||[]).map(source=>{const member=upsertCentralMember(db,source);member.roles=source.roles||[];return member;});
+  const relationsChanged=backfillCentralMemberRelations(db);
+  const changed=relationsChanged||before!==centralRosterFingerprint(ensureCentralMembers(db));
+  if(!changed)db.members=original;
+  return {changed,saved};
+}
+
+async function getPublicMembersFromDiscord({fresh=false}={}){
+  const nowMs=Date.now();
+  if(!fresh&&discordRosterCache.updatedAt&&nowMs-discordRosterCache.updatedAt<DISCORD_ROSTER_CACHE_MS){
+    outboundMetrics.discordRosterCacheHits++;
+    return discordRosterCache.members;
+  }
+  if(discordRosterLoading){
+    outboundMetrics.discordRosterRequestsDeduplicated++;
+    return discordRosterLoading;
+  }
+  outboundMetrics.discordRosterCacheMisses++;
+  discordRosterLoading=(async()=>{
   try{
     const guildId = CONFIG.guildId || process.env.GUILD_ID || process.env.DISCORD_GUILD_ID || CONFIG.serverId;
-    const guild = guildId ? await client.guilds.fetch(guildId).catch(()=>null) : client.guilds.cache.first();
+    const guild = guildId ? (client.guilds.cache.get(String(guildId))||await client.guilds.fetch(guildId).catch(()=>null)) : client.guilds.cache.first();
     if(!guild) return [];
+    outboundMetrics.discordFullMemberFetches++;
     const fetched = await guild.members.fetch().catch(()=>null);
     const collection = fetched || guild.members.cache;
     const familyRoleIds = new Set(Object.entries(CONFIG.roles || {})
       .filter(([name,value])=>name !== "bot" && value)
       .map(([,value])=>String(value)));
-    return Array.from(collection.values())
+    const members=Array.from(collection.values())
       .filter(m=>!m.user?.bot)
       .filter(m=>{
         if(String(m.id)===String(CONFIG.ownerId||""))return true;
@@ -1128,10 +1204,16 @@ async function getPublicMembersFromDiscord(){
         };
       })
       .sort((a,b)=>String(a.nick).localeCompare(String(b.nick),"uk"));
+    discordRosterCache={members,updatedAt:Date.now()};
+    return members;
   }catch(e){
     console.error("getPublicMembersFromDiscord failed", e);
-    return [];
+    return discordRosterCache.members||[];
+  }finally{
+    discordRosterLoading=null;
   }
+  })();
+  return discordRosterLoading;
 }
 
 function publicCleanGallery(db){
@@ -2702,13 +2784,13 @@ function buildHallOfFame(db, members){
 
 app.get("/api/public-dashboard", async (req,res)=>{
   try{
+    outboundMetrics.publicDashboardCalls++;
     res.set("Cache-Control","no-store, no-cache, must-revalidate, private");
     const db=readDb();
     const discordMembers=await getPublicMembersFromDiscord();
-    const dbMembersChanged=[];
-    for(const source of discordMembers){const saved=upsertCentralMember(db,source);saved.roles=source.roles||[];dbMembersChanged.push(saved);}
-    if(dbMembersChanged.length){backfillCentralMemberRelations(db);await writeDbAsync(db);}
-    const members=dbMembersChanged.map(publicCentralMember);
+    const rosterMerge=mergeDiscordRosterIntoDb(db,discordMembers);
+    if(rosterMerge.changed){outboundMetrics.rosterDbWrites++;await writeDbAsync(db);}else outboundMetrics.rosterDbWritesSkipped++;
+    const members=rosterMerge.saved.map(publicCentralMember);
     const cars=publicCleanCars(db);
     const gallery=publicCleanGallery(db);
     const familyInfo=db.familyInfo||{};
@@ -2727,7 +2809,7 @@ app.get("/api/public-dashboard", async (req,res)=>{
 
 
 app.get("/api/members-public", async (req,res)=>{
-  try{ const discordMembers=await getPublicMembersFromDiscord(); const db=readDb(); const saved=discordMembers.map(m=>{const x=upsertCentralMember(db,m);x.roles=m.roles||[];return x;}); if(saved.length){backfillCentralMemberRelations(db);await writeDbAsync(db);} const members=saved.map(publicCentralMember); const onlineCount=discordMembers.filter(m=>m.online||m.isOnline||/^(online|idle|dnd)$/i.test(String(m.status||m.presence||""))).length; res.json({ok:true,count:members.length,onlineCount,members}); }
+  try{ outboundMetrics.membersPublicCalls++; const discordMembers=await getPublicMembersFromDiscord(); const db=readDb(); const rosterMerge=mergeDiscordRosterIntoDb(db,discordMembers); if(rosterMerge.changed){outboundMetrics.rosterDbWrites++;await writeDbAsync(db);}else outboundMetrics.rosterDbWritesSkipped++; const members=rosterMerge.saved.map(publicCentralMember); const onlineCount=discordMembers.filter(m=>m.online||m.isOnline||/^(online|idle|dnd)$/i.test(String(m.status||m.presence||""))).length; res.set("Cache-Control","public, max-age=60, stale-while-revalidate=300"); res.json({ok:true,count:members.length,onlineCount,members}); }
   catch(e){ console.error("members public error",e); res.status(500).json({ok:false,error:"members_public_failed",message:e.message}); }
 });
 app.get("/api/members", protect, async (req,res)=>{
@@ -3571,10 +3653,12 @@ async function sendQueueItem(item){
 async function processDiscordQueue(limit=20){
   const db=readDb();
   db.discordQueue=Array.isArray(db.discordQueue)?db.discordQueue:[];
-  const items=db.discordQueue.filter(x=>x.status!=="sent").slice(0,limit);
+  const nowMs=Date.now();
+  const items=db.discordQueue.filter(x=>x.status!=="sent"&&x.status!=="dead"&&Number(x.attempts||0)<5&&Date.parse(x.nextAttemptAt||0)<=nowMs).slice(0,limit);
   let sent=0;
   for(const item of items){
     try{
+      outboundMetrics.discordQueueSendAttempts++;
       item.attempts=Number(item.attempts||0)+1;
       item.updatedAt=now();
       await sendQueueItem(item);
@@ -3584,11 +3668,16 @@ async function processDiscordQueue(limit=20){
       sent++;
     }catch(e){
       item.status="failed"; item.lastError=e?.message||String(e); item.updatedAt=now();
+      if(Number(item.attempts||0)>=5)item.status="dead";
+      else item.nextAttemptAt=new Date(Date.now()+Math.min(60*60*1000,Math.pow(2,Number(item.attempts||1))*60*1000)).toISOString();
       if(item.type === "farm_report") setDeliveryStatus(db, "farmReports", item.sourceId, "failed", item.id, item.lastError);
       if(item.type === "capt_signup") setDeliveryStatus(db, "capts", item.sourceId, "failed", item.id, item.lastError);
     }
   }
-  trimSystemLogs(db); writeDb(db); return {processed:items.length,sent};
+  // A read-only poll must not upload the complete database to Supabase. Before
+  // this guard an empty queue caused one full DB + members upsert every minute.
+  if(items.length){trimSystemLogs(db);writeDb(db);}
+  return {processed:items.length,sent};
 }
 async function sendOrQueueDiscord(type, channelId, payload, sourceId=""){
   try{
@@ -4059,6 +4148,18 @@ app.get("/api/system/status", protect, async (req,res)=>{
     console.error("system status error:", e);
     res.status(500).json({ok:false,error:"system_status_failed"});
   }
+});
+
+app.get("/api/system/network-metrics",protect,async(req,res)=>{
+  const member=await requireFamilyRole(req,res);if(!member)return;
+  const storage=getStorageNetworkMetrics();
+  res.json({
+    ok:true,
+    generatedAt:new Date().toISOString(),
+    discordAndEndpoints:{...outboundMetrics},
+    storage,
+    estimatedServiceInitiatedMB:Number((Number(storage.estimatedRequestBytes||0)/1024/1024).toFixed(3))
+  });
 });
 
 client.once("ready", async()=>{
@@ -5024,7 +5125,8 @@ app.post("/api/contracts", protect, ownerOnly, async (req,res)=>{
 
 app.get("/api/members-autofill", async (req,res)=>{
   try{
-    res.set("Cache-Control","no-store, no-cache, must-revalidate, private");
+    outboundMetrics.membersAutofillCalls++;
+    res.set("Cache-Control","public, max-age=60, stale-while-revalidate=300");
     const map = new Map();
     const db=readDb();
 
@@ -5053,10 +5155,6 @@ app.get("/api/members-autofill", async (req,res)=>{
       // the central member record. Merge those records only for people who are
       // still present in Discord, so an application can immediately become an
       // autocomplete option without resurrecting former members.
-      const guildId=CONFIG.guildId||process.env.GUILD_ID||process.env.DISCORD_GUILD_ID||CONFIG.serverId;
-      const guild=guildId?await client.guilds.fetch(guildId).catch(()=>null):client.guilds.cache.first();
-      const fetched=guild?await guild.members.fetch().catch(()=>null):null;
-      if(fetched)activeDiscordIds=new Set(Array.from(fetched.values()).filter(m=>!m.user?.bot).map(m=>String(m.id)));
       for(const central of ensureCentralMembers(db)){
         const discordId=normalizeDiscordUserId(central.discordUserId||central.discord_user_id);
         if(!discordId||!activeDiscordIds.has(discordId))continue;
@@ -5088,8 +5186,9 @@ app.get("/api/members-autofill", async (req,res)=>{
 
     // Historical DB records are intentionally not merged here. Autocomplete is
     // an active roster and must not resurrect members removed from Discord.
-    backfillCentralMemberRelations(db);
-    await writeDbAsync(db);
+    const before=centralRosterFingerprint(ensureCentralMembers(readDb()));
+    const relationsChanged=backfillCentralMemberRelations(db);
+    if(relationsChanged||before!==centralRosterFingerprint(ensureCentralMembers(db))){outboundMetrics.rosterDbWrites++;await writeDbAsync(db);}else outboundMetrics.rosterDbWritesSkipped++;
     const members = Array.from(new Set(Array.from(map.values())))
       .filter(x=>x.nick && x.nick !== "-")
       .sort((a,b)=>String(a.nick).localeCompare(String(b.nick),"uk"));

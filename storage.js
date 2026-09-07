@@ -128,15 +128,41 @@ function localWrite(data){
 // Якщо Supabase увімкнений, база підтягується в локальний кеш при старті і кожен writeDb пише в Supabase у фоні.
 let memoryDb = localRead();
 let supabaseWriteQueue=Promise.resolve();
+const storageNetworkMetrics={
+  startedAt:new Date().toISOString(),
+  fullDbWrites:0,
+  memberBatchWrites:0,
+  estimatedRequestBytes:0,
+  lastWriteAt:null,
+  lastDbBytes:0,
+  lastMemberBytes:0
+};
+
+function jsonBytes(value){
+  try{return Buffer.byteLength(JSON.stringify(value),"utf8");}catch{return 0;}
+}
 
 function queueSupabaseWrite(data){
   if(!supabase)return Promise.resolve({ok:true,mode:"local"});
   const snapshot=normalizeDb(JSON.parse(JSON.stringify(data)));
   const operation=supabaseWriteQueue.then(async()=>{
+    const dbPayload={id:SUPABASE_DB_KEY,data:snapshot,updated_at:new Date().toISOString()};
+    const dbBytes=jsonBytes(dbPayload);
+    storageNetworkMetrics.fullDbWrites++;
+    storageNetworkMetrics.estimatedRequestBytes+=dbBytes;
+    storageNetworkMetrics.lastDbBytes=dbBytes;
+    storageNetworkMetrics.lastWriteAt=new Date().toISOString();
     const {error}=await supabase
       .from("forbes_db")
-      .upsert({id:SUPABASE_DB_KEY,data:snapshot,updated_at:new Date().toISOString()});
+      .upsert(dbPayload);
     if(error)throw error;
+    const rows=memberRows(snapshot);
+    const memberBytes=jsonBytes(rows);
+    if(rows.length){
+      storageNetworkMetrics.memberBatchWrites++;
+      storageNetworkMetrics.estimatedRequestBytes+=memberBytes;
+      storageNetworkMetrics.lastMemberBytes=memberBytes;
+    }
     await syncMemberRows(snapshot);
     return {ok:true,mode:"supabase"};
   });
@@ -218,4 +244,8 @@ export function getDbInfo(){
     supabaseDbKey: SUPABASE_DB_KEY,
     localDbFile: DB_FILE
   };
+}
+
+export function getStorageNetworkMetrics(){
+  return {...storageNetworkMetrics,supabaseConfigured:Boolean(supabase)};
 }

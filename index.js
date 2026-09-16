@@ -1433,10 +1433,11 @@ app.put("/api/admin/birthdays/:id", protect, ownerOnly, async (req,res)=>{
     const staticId=String(req.body.staticId||"").trim();
     const day=Number(req.body.day||req.body.birthdayDay||0);
     const month=Number(req.body.month||req.body.birthdayMonth||0);
+    const year=Number(req.body.year||req.body.birthdayYear||0);
     if(!nickname)return res.status(400).json({ok:false,error:"nickname_required",message:"Вкажи нік."});
     if(!staticId)return res.status(400).json({ok:false,error:"static_id_required",message:"Вкажи Static ID."});
-    if(!Number.isInteger(day)||day<1||day>31||!Number.isInteger(month)||month<1||month>12)return res.status(400).json({ok:false,error:"invalid_birthday",message:"Вкажи правильний день і місяць."});
-    item.nickname=nickname; item.staticId=staticId; item.day=day; item.month=month;
+    if(!Number.isInteger(day)||day<1||day>31||!Number.isInteger(month)||month<1||month>12||!Number.isInteger(year)||year<1940||year>new Date().getFullYear())return res.status(400).json({ok:false,error:"invalid_birthday",message:"Вкажи повну правильну дату."});
+    item.nickname=nickname; item.staticId=staticId; item.day=day; item.month=month; item.year=year;
     item.enabled=req.body.enabled!==false; item.updatedAt=now(); item.updatedBy=String(req.user?.id||"");
     const wr=await writeDbAsync(db); if(!wr.ok)return res.status(500).json({ok:false,error:"birthday_db_write_failed",message:wr.error||"Не вдалося зберегти."});
     try{const ch=await channel(CONFIG.channels.birthdays);if(ch)await ch.send({embeds:[embed("✏️ День народження відредаговано",`**Нік:** ${item.nickname}
@@ -1465,14 +1466,15 @@ app.post("/api/birthdays", protect, async (req,res)=>{
     const staticId=String(req.body.staticId||req.body.playerId||"").trim();
     const day=Number(req.body.birthdayDay||req.body.day||0);
     const month=Number(req.body.birthdayMonth||req.body.month||0);
+    const year=Number(req.body.birthdayYear||req.body.year||0);
     if(!nickname) return res.status(400).json({ok:false,error:"nickname_required",message:"Вкажи RP-нік."});
     if(!staticId) return res.status(400).json({ok:false,error:"static_id_required",message:"Вкажи Static ID."});
-    if(!Number.isInteger(day)||day<1||day>31||!Number.isInteger(month)||month<1||month>12) return res.status(400).json({ok:false,error:"invalid_birthday",message:"Вкажи правильний день і місяць."});
+    if(!Number.isInteger(day)||day<1||day>31||!Number.isInteger(month)||month<1||month>12||!Number.isInteger(year)||year<1940||year>new Date().getFullYear()) return res.status(400).json({ok:false,error:"invalid_birthday",message:"Вкажи повну правильну дату."});
     const db=readDb(); db.birthdays=Array.isArray(db.birthdays)?db.birthdays:[];
     const discordId=String(req.user?.id||"");
     const centralMember=upsertCentralMember(db,{discordUserId:discordId,nickname,gameId:staticId});
     const existing=db.birthdays.find(x=>discordId&&String(x.discordUserId||"")===discordId)||db.birthdays.find(x=>String(x.staticId||"")===staticId);
-    const birthday={id:existing?.id||id("birthday"),memberId:centralMember.memberId,nickname,staticId,discordUserId:discordId,discordName:req.user?.name||req.user?.username||"",day,month,enabled:true,createdAt:existing?.createdAt||now(),updatedAt:now()};
+    const birthday={id:existing?.id||id("birthday"),memberId:centralMember.memberId,nickname,staticId,discordUserId:discordId,discordName:req.user?.name||req.user?.username||"",day,month,year,enabled:true,createdAt:existing?.createdAt||now(),updatedAt:now()};
     if(existing)Object.assign(existing,birthday);else db.birthdays.unshift(birthday);
     const wr=typeof writeDbAsync==="function"?await writeDbAsync(db):(writeDb(db),{ok:true});
     if(!wr.ok)return res.status(500).json({ok:false,error:"birthday_db_write_failed",message:wr.error||"Не вдалося зберегти."});
@@ -1514,6 +1516,7 @@ app.post("/api/applications", protect, async (req,res)=>{
       reason:req.body.reason||"",
       birthdayDay:Number(req.body.birthdayDay||0),
       birthdayMonth:Number(req.body.birthdayMonth||0),
+      birthdayYear:Number(req.body.birthdayYear||0),
       confirmed:Boolean(req.body.confirmed),
       status:"pending",
       createdAt:now()
@@ -1524,15 +1527,16 @@ app.post("/api/applications", protect, async (req,res)=>{
     if(isBirthdayApplication){
       const day=Number(item.birthdayDay);
       const month=Number(item.birthdayMonth);
-      if(!Number.isInteger(day)||day<1||day>31||!Number.isInteger(month)||month<1||month>12){
-        return res.status(400).json({ok:false,error:"invalid_birthday",message:"Вкажіть правильний день і місяць."});
+      const year=Number(item.birthdayYear);
+      if(!Number.isInteger(day)||day<1||day>31||!Number.isInteger(month)||month<1||month>12||!Number.isInteger(year)||year<1940||year>new Date().getFullYear()){
+        return res.status(400).json({ok:false,error:"invalid_birthday",message:"Вкажіть повну правильну дату."});
       }
       db.birthdays=Array.isArray(db.birthdays)?db.birthdays:[];
       const discordId=String(req.user?.id||"");
       const existing=db.birthdays.find(x=>discordId&&String(x.discordUserId||"")===discordId) || db.birthdays.find(x=>String(x.staticId||"")===String(item.staticId||""));
       const birthday={
         id:existing?.id||id("birthday"), memberId:centralMember.memberId, nickname:item.nickname, staticId:item.staticId, discordUserId:discordId,
-        discordName:item.discordName||item.discord, day, month, enabled:true,
+        discordName:item.discordName||item.discord, day, month, year, enabled:true,
         createdAt:existing?.createdAt||now(), updatedAt:now()
       };
       if(existing) Object.assign(existing,birthday); else db.birthdays.unshift(birthday);
@@ -3860,7 +3864,7 @@ app.get("/api/player-search", protect, async (req,res)=>{
         applications:applications.slice(0,20),
         capts:capts.slice(0,30),
         profile,
-        birthday:birthday?{day:Number(birthday.day||0),month:Number(birthday.month||0),enabled:birthday.enabled!==false}:null,
+        birthday:birthday?{day:Number(birthday.day||0),month:Number(birthday.month||0),year:Number(birthday.year||0),enabled:birthday.enabled!==false}:null,
         firstApplication:firstApplication?{id:firstApplication.id,type:firstApplication.type,status:firstApplication.status,createdAt:firstApplication.createdAt}:null,
         summary:{
           finesTotal:Number(profile?.stats?.fineCount||fines.length),

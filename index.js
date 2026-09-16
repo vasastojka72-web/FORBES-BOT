@@ -10,6 +10,8 @@ import { Client, GatewayIntentBits, Partials, EmbedBuilder, AttachmentBuilder, A
 import { CONFIG } from "./config.js";
 import { hasPermission } from "./role-permissions.js";
 import { parseForbesNickname } from "./nickname-parser.js";
+import { applySalaryLifetimeStats, lifetimeContractCount } from "./lifetime-stats.js";
+import { compactResolvedDiscipline, disciplineCounters } from "./discipline-stats.js";
 import {readDb, writeDb, writeDbAsync, id, initDb, getDbInfo, getStorageNetworkMetrics} from "./storage.js";
 import {ensureMediaSystem, uploadBase64Media, deleteMedia, getMediaPublicUrl, MEDIA_PATHS, mediaConfigured, downloadMedia} from "./media-storage.js";
 import { createDanceSyncManager } from "./dance-sync.js";
@@ -2430,6 +2432,7 @@ app.post("/api/fines/:id/status", protect, async (req,res)=>{
     const item=db.fines.find(x=>String(x.id)===String(req.params.id));
     if(!item)return res.status(404).json({ok:false,error:"fine_not_found"});
     item.status=status; item.updatedAt=now(); if(status==="paid")item.paidAt=item.paidAt||now(); if(status==="closed")item.closedAt=now();
+    compactResolvedDiscipline(db);
     await writeDbAsync(db); return res.json({ok:true,fine:item,fines:db.fines});
   }catch(e){console.error("fine status error",e);return res.status(500).json({ok:false,error:"fine_status_failed",message:e.message});}
 });
@@ -2454,6 +2457,7 @@ app.post("/api/warnings/:id/status", protect, async (req,res)=>{
     const item=db.warnings.find(x=>String(x.id)===String(req.params.id));
     if(!item)return res.status(404).json({ok:false,error:"warning_not_found"});
     item.status=status; item.updatedAt=now(); if(["removed","closed"].includes(status))item.closedAt=now();
+    compactResolvedDiscipline(db);
     await writeDbAsync(db); return res.json({ok:true,warning:item,warnings:db.warnings});
   }catch(e){console.error("warning status error",e);return res.status(500).json({ok:false,error:"warning_status_failed",message:e.message});}
 });
@@ -2512,7 +2516,7 @@ app.post("/api/fines/:id/paid", protect, async (req,res)=>{
         `**Статус:** оплачено`
       )]});
     }
-    writeDb(db);
+    compactResolvedDiscipline(db);writeDb(db);
     addLog(`Штраф ${f.id} оновлено: ${f.status}`, {fineId:f.id});
     return res.json({ok:true,fine:f});
   }catch(e){
@@ -2530,7 +2534,7 @@ app.post("/api/fines/:id/close", protect, async (req,res)=>{
     if(!f) return res.status(404).json({ok:false,error:"fine_not_found"});
     f.status = "closed";
     f.closedAt = now();
-    writeDb(db);
+    compactResolvedDiscipline(db);writeDb(db);
     addLog(`Штраф ${f.id} оновлено: ${f.status}`, {fineId:f.id});
     return res.json({ok:true,fine:f});
   }catch(e){
@@ -2581,7 +2585,7 @@ app.post("/api/warnings/:id/close", protect, async (req,res)=>{
         `**Статус:** закрито`
       )]});
     }
-    writeDb(db);
+    compactResolvedDiscipline(db);writeDb(db);
     addLog(`Догану ${w.id} оновлено: ${w.status}`, {warningId:w.id});
     return res.json({ok:true,warning:w});
   }catch(e){
@@ -2628,6 +2632,13 @@ function statKeyFor(nick, id){
 function ensureStatsDb(db){
   db.familyStatsManual = db.familyStatsManual || {};
   db.memberJoinDates = db.memberJoinDates || {};
+  db.memberLifetimeStats = db.memberLifetimeStats || {};
+  db.salaryCloseLedger = Array.isArray(db.salaryCloseLedger) ? db.salaryCloseLedger : [];
+  // One-time compatible backfill from the small salary archive that already exists.
+  for(const week of (Array.isArray(db.farmReportsArchive)?db.farmReportsArchive:[])){
+    applySalaryLifetimeStats(db,week.rows,week.salaryHash||week.id,week.closedAt||"");
+  }
+  compactResolvedDiscipline(db);
   db.hallOfFameManual = db.hallOfFameManual || {};
   return db;
 }
@@ -2635,7 +2646,6 @@ function buildForbesStats(db){
   ensureStatsDb(db);
   const capts = Array.isArray(db.capts) ? db.capts : [];
   const farmReports = Array.isArray(db.farmReports) ? db.farmReports : [];
-  const contracts = Array.isArray(db.contracts) ? db.contracts : [];
   const fines = Array.isArray(db.fines) ? db.fines : [];
   const warnings = Array.isArray(db.warnings) ? db.warnings : [];
   const giveaways = Array.isArray(db.giveaways) ? db.giveaways : [];
@@ -2688,11 +2698,14 @@ function buildMemberProfileFromDb(db, member){
     else if(statKeyFor(r.player||r.nickname, r.staticId||r.id) === key) farmCount++;
   }
 
-  let contractCount = 0;
-  for(const c of contracts){
-    const ownerKey = statKeyFor(c.nickname||c.nick||c.player, c.staticId||c.playerId||c.id);
-    if(ownerKey === key) contractCount++;
+  const lifetimeContracts=lifetimeContractCount(db,nick,staticId);
+  let currentContracts=0;
+  for(const report of farmReports){
+    if(String(report.status||"").toLowerCase()!=="approved")continue;
+    const players=Array.isArray(report.players)?report.players:[];
+    if(players.some(player=>statKeyFor(player.nick||player.nickname||player.name,player.id||player.staticId||player.playerId)===key))currentContracts++;
   }
+  const contractCount=lifetimeContracts+currentContracts;
 
   const memberCapts = capts.filter(c => {
     if(String(c.status||"").toLowerCase() !== "closed") return false;
@@ -2702,8 +2715,11 @@ function buildMemberProfileFromDb(db, member){
   const wins = memberCapts.filter(c=>String(c.result||"").toLowerCase()==="win").length;
   const losses = memberCapts.filter(c=>String(c.result||"").toLowerCase()==="loss").length;
 
-  const fineCount = fines.filter(f=>statKeyFor(f.nickname||f.nick, f.staticId||f.playerId) === key).length;
-  const warnCount = warnings.filter(w=>statKeyFor(w.nickname||w.nick, w.staticId||w.playerId) === key).length;
+  const activeFineCount = fines.filter(f=>statKeyFor(f.nickname||f.nick, f.staticId||f.playerId) === key).length;
+  const activeWarnCount = warnings.filter(w=>statKeyFor(w.nickname||w.nick, w.staticId||w.playerId) === key).length;
+  const history=disciplineCounters(db,nick,staticId);
+  const fineCount=activeFineCount+history.paidFines;
+  const warnCount=activeWarnCount+history.removedWarnings;
   const giveawayWins = giveaways.filter(g => (g.winners||[]).some(w=>String(w.userId||"")===String(member.discordId||member.id||"") || String(w.username||"").toLowerCase()===String(member.username||"").toLowerCase())).length;
 
   const achievements = [];
@@ -2724,7 +2740,7 @@ function buildMemberProfileFromDb(db, member){
     avatar: member.avatar || "",
     roles: member.roles || [],
     joinedAt: db.memberJoinDates[key] || member.joinedAt || "",
-    stats: {farmCount, contractCount, capts: memberCapts.length, wins, losses, fineCount, warnCount, giveawayWins},
+    stats: {farmCount,contractCount,capts:memberCapts.length,wins,losses,fineCount,warnCount,unpaidFines:activeFineCount,paidFines:history.paidFines,activeWarnings:activeWarnCount,removedWarnings:history.removedWarnings,giveawayWins},
     achievements
   };
 }
@@ -3241,7 +3257,7 @@ client.on("interactionCreate", async interaction=>{
         entityType:"warning_payment",
         entityId:p.id
       });
-
+      compactResolvedDiscipline(db);
       await writeDbAsync(db);
 
       return finishReviewButton(interaction,{
@@ -3280,7 +3296,7 @@ client.on("interactionCreate", async interaction=>{
         entityType:"fine_payment",
         entityId:p.id
       });
-
+      compactResolvedDiscipline(db);
       await writeDbAsync(db);
 
       const fineCh = await channel(CONFIG.channels.fines);
@@ -3734,6 +3750,7 @@ async function getGuildMembersSimple(){
       staticId: parsed.staticId,
       playerId: parsed.staticId,
       avatar: member.user.displayAvatarURL?.() || "",
+      joinedAt: member.joinedAt?.toISOString?.() || (member.joinedTimestamp?new Date(member.joinedTimestamp).toISOString():""),
       role: roles[0]?.name || "Учасник",
       highestRole: roles[0] || null,
       highestRoleName: roles[0]?.name || "Учасник",
@@ -3798,6 +3815,7 @@ app.get("/api/player-search", protect, async (req,res)=>{
     if(!q) return res.json({ok:true,query:q,result:null});
 
     const db = readDb();
+    ensureStatsDb(db);
     const members = await getGuildMembersSimple();
     const foundMembers = members.filter(m =>
       String(m.staticId||"").includes(q) ||
@@ -3817,22 +3835,42 @@ app.get("/api/player-search", protect, async (req,res)=>{
       const all = [...(c.yes||[]),...(c.no||[]),...(c.maybe||[]),...(c.absent||[])].map(String);
       return all.some(id=>id.toLowerCase().includes(q)) || String(c.enemy||"").toLowerCase().includes(q);
     });
+    const primary=foundMembers[0]||null;
+    const memberRef={
+      id:primary?.discordUserId||"",discordId:primary?.discordUserId||"",username:primary?.username||"",
+      nickname:primary?.nickname||applications[0]?.nickname||q,staticId:primary?.staticId||applications[0]?.staticId||"",
+      roles:primary?.roles||[],avatar:primary?.avatar||"",joinedAt:primary?.joinedAt||""
+    };
+    const profile=(primary||applications[0])?buildMemberProfileFromDb(db,memberRef):null;
+    const birthday=(db.birthdays||[]).find(x=>
+      (primary?.discordUserId&&String(x.discordUserId||"")===String(primary.discordUserId))||
+      (memberRef.staticId&&String(x.staticId||"")===String(memberRef.staticId))||playerMatches(x,q)
+    )||null;
+    const firstApplication=[...applications].sort((a,b)=>Date.parse(a.createdAt||0)-Date.parse(b.createdAt||0))[0]||null;
 
     res.set("Cache-Control","no-store, no-cache, must-revalidate, private");
     res.json({
       ok:true, query:q,
       result:{
         members:foundMembers.slice(0,20),
-        fines:fines.slice(0,50),
-        warnings:warnings.slice(0,50),
+        fines:[],
+        warnings:[],
         farmReports:farmReports.slice(0,50),
         blacklist:blacklist.slice(0,20),
         applications:applications.slice(0,20),
         capts:capts.slice(0,30),
+        profile,
+        birthday:birthday?{day:Number(birthday.day||0),month:Number(birthday.month||0),enabled:birthday.enabled!==false}:null,
+        firstApplication:firstApplication?{id:firstApplication.id,type:firstApplication.type,status:firstApplication.status,createdAt:firstApplication.createdAt}:null,
         summary:{
-          finesUnpaid:fines.filter(f=>f.status!=="paid"&&f.status!=="closed").length,
-          warningsActive:warnings.filter(w=>w.status==="active").length,
+          finesTotal:Number(profile?.stats?.fineCount||fines.length),
+          finesUnpaid:Number(profile?.stats?.unpaidFines||fines.length),
+          finesPaid:Number(profile?.stats?.paidFines||0),
+          warningsTotal:Number(profile?.stats?.warnCount||warnings.length),
+          warningsActive:Number(profile?.stats?.activeWarnings||warnings.length),
+          warningsClosed:Number(profile?.stats?.removedWarnings||0),
           farmApproved:farmReports.filter(r=>r.status==="approved").length,
+          contractsCompleted:Number(profile?.stats?.contractCount||0),
           blacklist:blacklist.length,
           capts:capts.length
         }
@@ -4255,6 +4293,8 @@ app.post("/api/salary/close-week", protect, async (req,res)=>{
     const text = String(req.body.text || "").trim();
 
     const db = readDb();
+    ensureStatsDb(db);
+    applySalaryLifetimeStats(db,rows,req.body.salaryHash,closedAt);
     const archived = Array.isArray(db.farmReports) ? db.farmReports : [];
     db.farmReportsArchive = Array.isArray(db.farmReportsArchive) ? db.farmReportsArchive : [];
     db.farmReportsArchive.unshift({
@@ -5560,7 +5600,7 @@ server.listen(PORT, ()=>{
 });
 
 initDb()
-  .then(async()=>{console.log("✅ DB initialized"); const db=readDb(); if(backfillCentralMemberRelations(db))await writeDbAsync(db); try{const m=await ensureMediaSystem(); (m.logs||[]).forEach(x=>console.log("✅ "+x)); console.log("✅ FORBES media system ready");}catch(e){console.error("⚠️ Media init failed:",e.message);}})
+  .then(async()=>{console.log("✅ DB initialized"); const db=readDb(); const before=`${(db.fines||[]).length}:${(db.warnings||[]).length}:${(db.disciplineArchiveLedger||[]).length}`;ensureStatsDb(db);const changed=before!==`${(db.fines||[]).length}:${(db.warnings||[]).length}:${(db.disciplineArchiveLedger||[]).length}`;if(backfillCentralMemberRelations(db)||changed)await writeDbAsync(db); try{const m=await ensureMediaSystem(); (m.logs||[]).forEach(x=>console.log("✅ "+x)); console.log("✅ FORBES media system ready");}catch(e){console.error("⚠️ Media init failed:",e.message);}})
   .catch(e=>console.error("⚠️ DB init failed, continuing:", e?.message || e))
   .finally(()=>{
     if(!process.env.DISCORD_BOT_TOKEN){

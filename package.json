@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "test:dance": "node dance-sync.test.js"
+    "test:dance": "node dance-sync.test.js",
+    "test:roles": "node role-permissions.test.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

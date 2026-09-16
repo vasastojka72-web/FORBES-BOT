@@ -4,31 +4,35 @@ export const CONFIG = {
   guildId: process.env.DISCORD_GUILD_ID || process.env.GUILD_ID || "1504699361668497419",
   ownerId: process.env.OWNER_ID || "502825427761365026",
 
-  // Discord role IDs from your FORBES server. Names here match your Discord roles.
+  discordInvite: "https://discord.gg/aPG8DGGGGt",
+
+  // Canonical Discord role IDs. Permission checks must use these IDs.
   roles: {
     bot: "1504883501978095657",             // 🤖 BOT / FORBES BOT
     member: "1504870552152571954",         // Учасник
-    newbie: "1504870592162168843",         // новобранець
-    farmer: "1504870952880701592",         // Фармер
-    farmManager: "1504871085223706664",    // Фарм менеджер
-    fighter: "1504871275917738066",        // Боєць
-    capt: "1504871411230179359",           // Каптер
-    seniorCapt: "1504871617543536782",     // Старший каптер
-    rightHand: "1504871693397790871",      // Права рука
-    deputy: "1504871859261538425"          // Зам.лідера
+    boss: "1549814900963016805",
+    leader2: "1504871859261538425",
+    deputy: "1504871693397790871",
+    headCapt: "1504871617543536782",
+    depHeadCapt: "1549097790456467660",
+    farmManager: "1504871085223706664",
+    capper: "1504871411230179359",
+    farmer: "1504870952880701592",
+    buyout: "1504871275917738066",
+    debtor: "1504870592162168843",
+    // Backward-compatible aliases for existing code/data. Do not use for new checks.
+    newbie: "1504870592162168843", fighter: "1504871275917738066",
+    capt: "1504871411230179359", seniorCapt: "1504871617543536782",
+    rightHand: "1504871693397790871"
   },
 
   roleNames: {
     bot: "BOT / FORBES BOT",
     member: "Учасник",
-    newbie: "новобранець",
-    farmer: "Фармер",
-    farmManager: "Фарм менеджер",
-    fighter: "Боєць",
-    capt: "Каптер",
-    seniorCapt: "Старший каптер",
-    rightHand: "Права рука",
-    deputy: "Зам.лідера"
+    boss: "BOSS", leader2: "Лідер №2", deputy: "Зам",
+    headCapt: "Head Capt", depHeadCapt: "Dep. Head Capt",
+    farmManager: "Farm Manager", capper: "Capper", farmer: "Farmer",
+    buyout: "Відкуп", debtor: "Боржник"
   },
 
   // Discord channel IDs you gave me earlier.

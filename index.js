@@ -8,6 +8,8 @@ import cors from "cors";
 import cron from "node-cron";
 import { Client, GatewayIntentBits, Partials, EmbedBuilder, AttachmentBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, REST, Routes, SlashCommandBuilder } from "discord.js";
 import { CONFIG } from "./config.js";
+import { hasPermission } from "./role-permissions.js";
+import { parseForbesNickname } from "./nickname-parser.js";
 import {readDb, writeDb, writeDbAsync, id, initDb, getDbInfo, getStorageNetworkMetrics} from "./storage.js";
 import {ensureMediaSystem, uploadBase64Media, deleteMedia, getMediaPublicUrl, MEDIA_PATHS, mediaConfigured, downloadMedia} from "./media-storage.js";
 import { createDanceSyncManager } from "./dance-sync.js";
@@ -559,15 +561,16 @@ function _mainId(req){
 function canCaptAll(member,req){
   return _mainId(req)
     || userHasAnyRole(member, [
-      CONFIG.roles.leader,
-      CONFIG.roles.owner,
+      CONFIG.roles.boss,
+      CONFIG.roles.leader2,
       CONFIG.roles.deputy,
-      CONFIG.roles.rightHand,
-      CONFIG.roles.seniorCapt
-    ])
-    || _hasAnyRole(member,["лідер","leader","зам","права рука","старший каптер"]);
+      CONFIG.roles.headCapt,
+      CONFIG.roles.depHeadCapt
+    ]);
 }
-function canDisciplineAll(member,req){ return forbes2026Discipline(member,req); }
+function canIssueFine(member,req){ return forbes2026Main(req)||hasPermission(member,"ISSUE_FINE"); }
+function canIssueWarning(member,req){ return forbes2026Main(req)||hasPermission(member,"ISSUE_WARNING"); }
+function canDisciplineAll(member,req){ return canIssueFine(member,req); }
 
 function denyPerm(res,msg){return res.status(403).json({ok:false,error:"no_permission",message:msg||"Недостатньо прав."});}
 
@@ -1095,17 +1098,7 @@ function cleanPublicRolesForbes(member){
 
 /* === FORBES MEMBERS STATIC ID FINAL SOURCE === */
 function parseForbesStaticNickFinal(raw){
-  raw = String(raw || "").trim();
-  let nick = raw;
-  let staticId = "";
-  const parts = raw.split("|").map(x=>x.trim()).filter(Boolean);
-  const numeric = parts.find(x=>/^\d{1,10}$/.test(x));
-  if(numeric) staticId = numeric;
-  const possibleNick = parts.find(x=>!/^\d{1,10}$/.test(x) && !/^(cpt|farm|фарм|учасник|боєць|капер|каптер)$/i.test(x));
-  if(possibleNick) nick = possibleNick;
-  const m = raw.match(/^(.+?)\s*(?:#|\||\[|\()\s*(\d{1,10})\s*(?:\]|\))?$/);
-  if(m){ nick = m[1].trim(); staticId = m[2].trim(); }
-  return {nick:nick.replace(/\s+/g," ").trim(), staticId};
+  return parseForbesNickname(raw);
 }
 function cleanForbesRolesFinal(member){
   try{
@@ -1930,9 +1923,9 @@ async function requireCaptManagerFromRequest(req, res){
     console.warn("CAPT ACTION DENIED", {
       userId: member.id,
       roles: getMemberRoleIds(member),
-      allowed: [CONFIG.roles.leader,CONFIG.roles.owner,CONFIG.roles.deputy,CONFIG.roles.rightHand,CONFIG.roles.seniorCapt].filter(Boolean)
+      allowed: [CONFIG.roles.boss,CONFIG.roles.leader2,CONFIG.roles.deputy,CONFIG.roles.headCapt,CONFIG.roles.depHeadCapt].filter(Boolean)
     });
-    res.status(403).json({ok:false,error:"no_permission",message:"Недостатньо прав. Потрібна роль Старший каптер / Права рука / Зам / Лідер."});
+    res.status(403).json({ok:false,error:"no_permission",message:"Недостатньо прав. Потрібна роль Head Capt / Dep. Head Capt / Зам / Лідер №2 / BOSS."});
     return null;
   }
   return member;
@@ -1950,9 +1943,9 @@ app.post("/api/capts", protect, async (req,res)=>{
       console.warn("CAPT CREATE DENIED", {
         userId: member.id,
         roles: member.roles?.cache ? Array.from(member.roles.cache.keys()) : [],
-        allowed: [CONFIG.roles.leader, CONFIG.roles.owner, CONFIG.roles.deputy, CONFIG.roles.rightHand, CONFIG.roles.seniorCapt].filter(Boolean)
+        allowed: [CONFIG.roles.boss,CONFIG.roles.leader2,CONFIG.roles.deputy,CONFIG.roles.headCapt,CONFIG.roles.depHeadCapt].filter(Boolean)
       });
-      return res.status(403).json({ok:false,error:"no_permission",message:"Запит на капт можуть робити тільки Старший каптер / Права рука / Зам.лідера / Лідер."});
+      return res.status(403).json({ok:false,error:"no_permission",message:"Запит на капт можуть робити тільки Head Capt / Dep. Head Capt / Зам / Лідер №2 / BOSS."});
     }
 
     const item={
@@ -2236,7 +2229,7 @@ app.post("/api/fines", protect, async (req,res)=>{
   try{
     const member = await requireFamilyRole(req, res);
     if(!member) return;
-    if(member && typeof canDisciplineAll === "function" && !canDisciplineAll(member, req)) return denyPerm(res,"Недостатньо прав для штрафів/доган.");
+    if(!canIssueFine(member,req)) return denyPerm(res,"Недостатньо прав для видачі штрафу.");
 
     const db=readDb();
     db.fines = Array.isArray(db.fines) ? db.fines : [];
@@ -2352,7 +2345,7 @@ app.post("/api/fine-payments", protect, async (req,res)=>{
 app.post("/api/warnings", protect, async (req,res)=>{
   try{
     const member=await requireFamilyRole(req,res); if(!member)return;
-    if(member&&typeof canDisciplineAll==="function"&&!canDisciplineAll(member,req)) return denyPerm(res,"Недостатньо прав для штрафів/доган.");
+    if(!canIssueWarning(member,req)) return denyPerm(res,"Недостатньо прав для видачі догани.");
     const db=readDb(); db.warnings=Array.isArray(db.warnings)?db.warnings:[];
     const expires=new Date(Date.now()+CONFIG.warnings.days*86400000);
     let centralTarget=findCentralMember(db,req.body||{});
@@ -2429,7 +2422,7 @@ app.get("/api/warnings", protect, (req,res)=>{
 app.post("/api/fines/:id/status", protect, async (req,res)=>{
   try{
     const member=await requireFamilyRole(req,res); if(!member)return;
-    if(typeof canDisciplineAll==="function"&&!canDisciplineAll(member,req)) return denyPerm(res,"Недостатньо прав для штрафів/доган.");
+    if(!canIssueFine(member,req)) return denyPerm(res,"Недостатньо прав для керування штрафами.");
     const allowed=["unpaid","payment_pending","paid","rejected","closed"];
     const status=String(req.body.status||"");
     if(!allowed.includes(status)) return res.status(400).json({ok:false,error:"bad_status"});
@@ -2443,7 +2436,7 @@ app.post("/api/fines/:id/status", protect, async (req,res)=>{
 app.delete("/api/fines/:id", protect, async (req,res)=>{
   try{
     const member=await requireFamilyRole(req,res); if(!member)return;
-    if(typeof canDisciplineAll==="function"&&!canDisciplineAll(member,req)) return denyPerm(res,"Недостатньо прав для штрафів/доган.");
+    if(!canIssueFine(member,req)) return denyPerm(res,"Недостатньо прав для керування штрафами.");
     const db=readDb(); db.fines=Array.isArray(db.fines)?db.fines:[];
     const before=db.fines.length; db.fines=db.fines.filter(x=>String(x.id)!==String(req.params.id));
     if(db.fines.length===before)return res.status(404).json({ok:false,error:"fine_not_found"});
@@ -2453,7 +2446,7 @@ app.delete("/api/fines/:id", protect, async (req,res)=>{
 app.post("/api/warnings/:id/status", protect, async (req,res)=>{
   try{
     const member=await requireFamilyRole(req,res); if(!member)return;
-    if(typeof canDisciplineAll==="function"&&!canDisciplineAll(member,req)) return denyPerm(res,"Недостатньо прав для штрафів/доган.");
+    if(!canIssueWarning(member,req)) return denyPerm(res,"Недостатньо прав для керування доганами.");
     const allowed=["active","remove_pending","removed","rejected","closed"];
     const status=String(req.body.status||"");
     if(!allowed.includes(status)) return res.status(400).json({ok:false,error:"bad_status"});
@@ -2467,7 +2460,7 @@ app.post("/api/warnings/:id/status", protect, async (req,res)=>{
 app.delete("/api/warnings/:id", protect, async (req,res)=>{
   try{
     const member=await requireFamilyRole(req,res); if(!member)return;
-    if(typeof canDisciplineAll==="function"&&!canDisciplineAll(member,req)) return denyPerm(res,"Недостатньо прав для штрафів/доган.");
+    if(!canIssueWarning(member,req)) return denyPerm(res,"Недостатньо прав для керування доганами.");
     const db=readDb(); db.warnings=Array.isArray(db.warnings)?db.warnings:[];
     const before=db.warnings.length; db.warnings=db.warnings.filter(x=>String(x.id)!==String(req.params.id));
     if(db.warnings.length===before)return res.status(404).json({ok:false,error:"warning_not_found"});
@@ -2478,7 +2471,7 @@ app.delete("/api/warnings/:id", protect, async (req,res)=>{
 app.post("/api/fines/:id/remind", protect, async (req,res)=>{
   try{
     const member=await requireFamilyRole(req,res); if(!member)return;
-    if(!canDisciplineAll(member,req)) return denyPerm(res,"Недостатньо прав для штрафів/доган.");
+    if(!canIssueFine(member,req)) return denyPerm(res,"Недостатньо прав для керування штрафами.");
     const db = readDb();
     const f = (db.fines || []).find(x => x.id === req.params.id);
     if(!f) return res.status(404).json({ok:false,error:"fine_not_found"});
@@ -2505,7 +2498,7 @@ app.post("/api/fines/:id/remind", protect, async (req,res)=>{
 app.post("/api/fines/:id/paid", protect, async (req,res)=>{
   try{
     const member=await requireFamilyRole(req,res); if(!member)return;
-    if(!canDisciplineAll(member,req)) return denyPerm(res,"Недостатньо прав для штрафів/доган.");
+    if(!canIssueFine(member,req)) return denyPerm(res,"Недостатньо прав для керування штрафами.");
     const db = readDb();
     const f = (db.fines || []).find(x => x.id === req.params.id);
     if(!f) return res.status(404).json({ok:false,error:"fine_not_found"});
@@ -2531,7 +2524,7 @@ app.post("/api/fines/:id/paid", protect, async (req,res)=>{
 app.post("/api/fines/:id/close", protect, async (req,res)=>{
   try{
     const member=await requireFamilyRole(req,res); if(!member)return;
-    if(!canDisciplineAll(member,req)) return denyPerm(res,"Недостатньо прав для штрафів/доган.");
+    if(!canIssueFine(member,req)) return denyPerm(res,"Недостатньо прав для керування штрафами.");
     const db = readDb();
     const f = (db.fines || []).find(x => x.id === req.params.id);
     if(!f) return res.status(404).json({ok:false,error:"fine_not_found"});
@@ -2548,7 +2541,7 @@ app.post("/api/fines/:id/close", protect, async (req,res)=>{
 app.post("/api/warnings/:id/remind", protect, async (req,res)=>{
   try{
     const member=await requireFamilyRole(req,res); if(!member)return;
-    if(!canDisciplineAll(member,req)) return denyPerm(res,"Недостатньо прав для штрафів/доган.");
+    if(!canIssueWarning(member,req)) return denyPerm(res,"Недостатньо прав для керування доганами.");
     const db = readDb();
     const w = (db.warnings || []).find(x => x.id === req.params.id);
     if(!w) return res.status(404).json({ok:false,error:"warning_not_found"});
@@ -2574,7 +2567,7 @@ app.post("/api/warnings/:id/remind", protect, async (req,res)=>{
 app.post("/api/warnings/:id/close", protect, async (req,res)=>{
   try{
     const member=await requireFamilyRole(req,res); if(!member)return;
-    if(!canDisciplineAll(member,req)) return denyPerm(res,"Недостатньо прав для штрафів/доган.");
+    if(!canIssueWarning(member,req)) return denyPerm(res,"Недостатньо прав для керування доганами.");
     const db = readDb();
     const w = (db.warnings || []).find(x => x.id === req.params.id);
     if(!w) return res.status(404).json({ok:false,error:"warning_not_found"});
@@ -2970,12 +2963,7 @@ function userHasAnyRole(member, roleIds = []){
 
 
 function canManage(member){
-  return userHasAnyRole(member, [
-    CONFIG.roles.leader,
-    CONFIG.roles.owner,
-    CONFIG.roles.deputy,
-    CONFIG.roles.rightHand
-  ]);
+  return hasPermission(member,"FULL_ADMIN");
 }
 
 
@@ -2987,12 +2975,12 @@ function canManage(member){
 
 function canUseCaptSignup(member){
   return userHasAnyRole(member, [
-    CONFIG.roles.leader,
-    CONFIG.roles.owner,
+    CONFIG.roles.boss,
+    CONFIG.roles.leader2,
     CONFIG.roles.deputy,
-    CONFIG.roles.rightHand,
-    CONFIG.roles.seniorCapt,
-    CONFIG.roles.capt
+    CONFIG.roles.headCapt,
+    CONFIG.roles.depHeadCapt,
+    CONFIG.roles.capper
   ]);
 }
 function canManageCaptLists(member,req=null){return canCaptAll(member,req)||forbes2026Capt(member,req);}
@@ -3001,15 +2989,14 @@ function canModerateFarmReports(member){ return forbes2026Farm(member,null); }
 function canModerateWarningsAndFines(member){ return forbes2026Discipline(member,null); }
 
 function canModerateApplications(member,req){
-  return forbes2026Full(member,req)||forbes2026HasId(member,[FORBES_ACCESS_ROLE_IDS_2026.farmManager,FORBES_ACCESS_ROLE_IDS_2026.seniorCapt,CONFIG.roles.farmManager,CONFIG.roles.seniorCapt])||forbes2026HasName(member,["фарм менеджер","старший каптер"]);
+  return forbes2026Full(member,req)||forbes2026HasId(member,[CONFIG.roles.farmManager,CONFIG.roles.headCapt]);
 }
 function canManageBlacklist(member){
   return userHasAnyRole(member, [
-    CONFIG.roles.leader,
-    CONFIG.roles.owner,
+    CONFIG.roles.boss,
+    CONFIG.roles.leader2,
     CONFIG.roles.deputy,
-    CONFIG.roles.rightHand,
-    CONFIG.roles.seniorCapt
+    CONFIG.roles.headCapt
   ]);
 }
 
@@ -3132,7 +3119,7 @@ client.on("interactionCreate", async interaction=>{
       const type=String(app.type||"").toLowerCase();
       const isDismiss=type.includes("увал")||type.includes("звіль")||type==="dismissal";
       const allowed=isDismiss
-        ? userHasAnyRole(member,[CONFIG.roles.leader,CONFIG.roles.owner,CONFIG.roles.deputy,CONFIG.roles.rightHand])
+        ? hasPermission(member,"FULL_ADMIN")
         : canModerateApplications(member,interaction);
       if(!allowed){
         return denyNoPerm(interaction,isDismiss
@@ -3875,7 +3862,7 @@ app.post("/api/reminders/fines", protect, async (req,res)=>{
     const member = await requireFamilyRole(req,res); if(!member) return;
 
   /* FORBES_DISC_ALL_PATCH */
-  if(member && !canDisciplineAll(member, req)) return denyPerm(res,"Недостатньо прав для штрафів/доган.");
+  if(!canIssueFine(member,req)) return denyPerm(res,"Недостатньо прав для керування штрафами.");
     if(!canModerateWarningsAndFines(member) && !canModerateFarmReports(member)){
       return res.status(403).json({ok:false,error:"no_permission"});
     }
@@ -3901,7 +3888,7 @@ app.post("/api/reminders/warnings", protect, async (req,res)=>{
     const member = await requireFamilyRole(req,res); if(!member) return;
 
   /* FORBES_DISC_ALL_PATCH */
-  if(member && !canDisciplineAll(member, req)) return denyPerm(res,"Недостатньо прав для штрафів/доган.");
+  if(!canIssueWarning(member,req)) return denyPerm(res,"Недостатньо прав для керування доганами.");
     if(!canModerateWarningsAndFines(member) && !canModerateFarmReports(member)){
       return res.status(403).json({ok:false,error:"no_permission"});
     }
@@ -4544,7 +4531,7 @@ app.post("/api/announcements", protect, async (req,res)=>{
     const seniorCategories={
       all:{title:"👥 Повідомлення для всіх",label:"Для всіх",channelId:CONFIG.channels.generalChat,targetType:"ALL",roleIds:[]},
       farm:{title:"🌾 Повідомлення для фарму",label:"Фарм",channelId:CONFIG.channels.seniorFarmMessages,targetType:"ROLES",roleIds:[CONFIG.roles.farmer,CONFIG.roles.farmManager].map(String).filter(Boolean)},
-      capt:{title:"⚔️ Повідомлення для капту",label:"Капт",channelId:CONFIG.channels.seniorCaptMessages,targetType:"ROLES",roleIds:[CONFIG.roles.capt,CONFIG.roles.seniorCapt].map(String).filter(Boolean)}
+      capt:{title:"⚔️ Повідомлення для капту",label:"Капт",channelId:CONFIG.channels.seniorCaptMessages,targetType:"ROLES",roleIds:[CONFIG.roles.capper,CONFIG.roles.headCapt,CONFIG.roles.depHeadCapt].map(String).filter(Boolean)}
     };
     const announcementCategories={
       all:{title:"📢 Загальне оголошення",label:"Загальне",channelId:CONFIG.channels.announcements,targetType:"ALL",roleIds:[]},
@@ -4628,7 +4615,7 @@ app.post("/api/announcements-legacy", protect, async (req,res)=>{
   try{
     const annMember=await apiMemberFromRequest(req);
     const annType=String(req.body.type||"all").toLowerCase();
-    const canGeneral=_mainId(req)||userHasAnyRole(annMember,[CONFIG.roles.deputy,CONFIG.roles.rightHand]);
+    const canGeneral=_mainId(req)||hasPermission(annMember,"FULL_ADMIN");
     const canFarm=canGeneral||forbes2026Farm(annMember,req)||userHasAnyRole(annMember,[CONFIG.roles.farmManager]);
     if(annType==="farm" ? !canFarm : !canGeneral) return res.status(403).json({ok:false,error:"no_permission",message:"Немає прав."});
     const db=readDb();
@@ -5206,7 +5193,7 @@ function finalHas(member,ids,names){const rs=finalRoles(member);return rs.some(r
 function finalOwner(req){return _mainId(req);}
 async function finalMember(req){return apiMemberFromRequest(req);}
 async function finalCanContent(req){return finalOwner(req);}
-async function finalCanFarmAnn(req){if(finalOwner(req))return true;const m=await finalMember(req);return finalHas(m,[CONFIG.roles.deputy,CONFIG.roles.rightHand,CONFIG.roles.farmManager],["зам","права рука","фарм менеджер"]);}
+async function finalCanFarmAnn(req){if(finalOwner(req))return true;const m=await finalMember(req);return finalHas(m,[CONFIG.roles.boss,CONFIG.roles.leader2,CONFIG.roles.deputy,CONFIG.roles.farmManager],[]);}
 function backupMedia(db,type,payload,action="update"){db.mediaBackups=Array.isArray(db.mediaBackups)?db.mediaBackups:[];db.mediaBackups.unshift({id:id("backup"),type,action,payload:JSON.parse(JSON.stringify(payload||null)),createdAt:new Date().toISOString()});db.mediaBackups=db.mediaBackups.slice(0,200);}
 function mediaDb(db){db.galleryAlbums=Array.isArray(db.galleryAlbums)?db.galleryAlbums:[];db.musicTracks=Array.isArray(db.musicTracks)?db.musicTracks:[];db.cars=Array.isArray(db.cars)?db.cars:[];db.estate=db.estate||{title:"Фото маєтку",description:"",photos:[]};db.office=db.office||{title:"Офіс",description:"",photos:[]};db.familyHistory=db.familyHistory||{title:"Історія сім’ї",text:"",photos:[]};db.leadership=Array.isArray(db.leadership)?db.leadership:[];db.mediaBackups=Array.isArray(db.mediaBackups)?db.mediaBackups:[];return db;}
 app.get("/api/v2/content", async (req,res)=>{
@@ -5374,11 +5361,8 @@ app.delete("/api/complaints/:id", protect, async(req,res)=>{
 
 /* === FORBES CENTRAL ROLE MATRIX 2026 === */
 const FORBES_ACCESS_ROLE_IDS_2026 = Object.freeze({
-  leader2: "1504871859261538425",
-  deputy: "1504871693397790871",
-  farmManager: "1504871085223706664",
-  complaintAdmin: "1527167132696313866",
-  seniorCapt: "1504871617543536782"
+  ...CONFIG.roles,
+  complaintAdmin: COMPLAINT_ADMIN_ROLE_ID
 });
 function forbes2026RoleIds(member){
   try{ if(member?.roles?.cache) return Array.from(member.roles.cache.keys()).map(String); if(Array.isArray(member?.roles)) return member.roles.map(r=>String(r?.id||r||"")); }catch(e){} return [];
@@ -5393,10 +5377,12 @@ function forbes2026HasName(member,names){
   return have.some(role=>want.some(name=>role===name||role.includes(name)));
 }
 function forbes2026Main(req){ try{ if(typeof _mainId==='function'&&_mainId(req))return true; if(typeof forbesMainIdFromReq==='function'&&forbesMainIdFromReq(req))return true; }catch(e){} return false; }
-function forbes2026Full(member,req){ return forbes2026Main(req)||forbes2026HasId(member,[FORBES_ACCESS_ROLE_IDS_2026.leader2,FORBES_ACCESS_ROLE_IDS_2026.deputy]); }
+function forbes2026Full(member,req){ return forbes2026Main(req)||forbes2026HasId(member,[CONFIG.roles.boss,CONFIG.roles.leader2,CONFIG.roles.deputy]); }
 function forbes2026Farm(member,req){ return forbes2026Full(member,req)||forbes2026HasId(member,[FORBES_ACCESS_ROLE_IDS_2026.farmManager]); }
-function forbes2026Capt(member,req){ return forbes2026Full(member,req)||forbes2026HasId(member,[FORBES_ACCESS_ROLE_IDS_2026.seniorCapt,CONFIG.roles.seniorCapt]); }
-function forbes2026Discipline(member,req){ return forbes2026Farm(member,req)||forbes2026Capt(member,req); }
+function forbes2026Capt(member,req){ return forbes2026Full(member,req)||forbes2026HasId(member,[CONFIG.roles.headCapt,CONFIG.roles.depHeadCapt]); }
+function forbes2026Fine(member,req){ return forbes2026Farm(member,req)||forbes2026Capt(member,req); }
+function forbes2026Warning(member,req){ return forbes2026Farm(member,req)||forbes2026HasId(member,[CONFIG.roles.headCapt]); }
+function forbes2026Discipline(member,req){ return forbes2026Fine(member,req); }
 function forbes2026Complaints(member,req){ return forbes2026Full(member,req)||forbes2026HasId(member,[FORBES_ACCESS_ROLE_IDS_2026.complaintAdmin])||forbes2026HasName(member,['адміністратор скарг']); }
 
 
@@ -5411,8 +5397,7 @@ function chargeIsStaff(member,req){
   // Модерація звітів заряду: власник, лідер, лідер 2, зам лідера, старший каптер.
   // Звичайні учасники можуть бачити предмети й подавати звіти, але не модерувати.
   return chargeIsOwnerReq(req)||forbes2026Main(req)||
-    forbes2026HasId(member,[CONFIG.roles.leader,FORBES_ACCESS_ROLE_IDS_2026.leader2,FORBES_ACCESS_ROLE_IDS_2026.deputy,FORBES_ACCESS_ROLE_IDS_2026.seniorCapt,CONFIG.roles.seniorCapt])||
-    forbes2026HasName(member,['лідер','лідер 2','зам лідера','старший каптер']);
+    forbes2026HasId(member,[CONFIG.roles.boss,CONFIG.roles.leader2,CONFIG.roles.deputy,CONFIG.roles.headCapt]);
 }
 function chargeIsOwnerReq(req){ return String(req.user?.id||'')===String(CONFIG.ownerId); }
 function chargeCleanItems(items){

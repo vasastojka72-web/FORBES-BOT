@@ -1436,7 +1436,7 @@ app.put("/api/admin/birthdays/:id", protect, ownerOnly, async (req,res)=>{
     const year=Number(req.body.year||req.body.birthdayYear||0);
     if(!nickname)return res.status(400).json({ok:false,error:"nickname_required",message:"Вкажи нік."});
     if(!staticId)return res.status(400).json({ok:false,error:"static_id_required",message:"Вкажи Static ID."});
-    if(!Number.isInteger(day)||day<1||day>31||!Number.isInteger(month)||month<1||month>12||!Number.isInteger(year)||year<1940||year>new Date().getFullYear())return res.status(400).json({ok:false,error:"invalid_birthday",message:"Вкажи повну правильну дату."});
+    if(!Number.isInteger(day)||day<1||day>31||!Number.isInteger(month)||month<1||month>12||(year!==0&&(!Number.isInteger(year)||year<1940||year>new Date().getFullYear())))return res.status(400).json({ok:false,error:"invalid_birthday",message:"Вкажи правильні число та місяць. Рік — за бажанням."});
     item.nickname=nickname; item.staticId=staticId; item.day=day; item.month=month; item.year=year;
     item.enabled=req.body.enabled!==false; item.updatedAt=now(); item.updatedBy=String(req.user?.id||"");
     const wr=await writeDbAsync(db); if(!wr.ok)return res.status(500).json({ok:false,error:"birthday_db_write_failed",message:wr.error||"Не вдалося зберегти."});
@@ -1469,7 +1469,7 @@ app.post("/api/birthdays", protect, async (req,res)=>{
     const year=Number(req.body.birthdayYear||req.body.year||0);
     if(!nickname) return res.status(400).json({ok:false,error:"nickname_required",message:"Вкажи RP-нік."});
     if(!staticId) return res.status(400).json({ok:false,error:"static_id_required",message:"Вкажи Static ID."});
-    if(!Number.isInteger(day)||day<1||day>31||!Number.isInteger(month)||month<1||month>12||!Number.isInteger(year)||year<1940||year>new Date().getFullYear()) return res.status(400).json({ok:false,error:"invalid_birthday",message:"Вкажи повну правильну дату."});
+    if(!Number.isInteger(day)||day<1||day>31||!Number.isInteger(month)||month<1||month>12||(year!==0&&(!Number.isInteger(year)||year<1940||year>new Date().getFullYear()))) return res.status(400).json({ok:false,error:"invalid_birthday",message:"Вкажи правильні число та місяць. Рік — за бажанням."});
     const db=readDb(); db.birthdays=Array.isArray(db.birthdays)?db.birthdays:[];
     const discordId=String(req.user?.id||"");
     const centralMember=upsertCentralMember(db,{discordUserId:discordId,nickname,gameId:staticId});
@@ -1528,8 +1528,8 @@ app.post("/api/applications", protect, async (req,res)=>{
       const day=Number(item.birthdayDay);
       const month=Number(item.birthdayMonth);
       const year=Number(item.birthdayYear);
-      if(!Number.isInteger(day)||day<1||day>31||!Number.isInteger(month)||month<1||month>12||!Number.isInteger(year)||year<1940||year>new Date().getFullYear()){
-        return res.status(400).json({ok:false,error:"invalid_birthday",message:"Вкажіть повну правильну дату."});
+      if(!Number.isInteger(day)||day<1||day>31||!Number.isInteger(month)||month<1||month>12||(year!==0&&(!Number.isInteger(year)||year<1940||year>new Date().getFullYear()))){
+        return res.status(400).json({ok:false,error:"invalid_birthday",message:"Вкажіть правильні число та місяць. Рік — за бажанням."});
       }
       db.birthdays=Array.isArray(db.birthdays)?db.birthdays:[];
       const discordId=String(req.user?.id||"");
@@ -3733,9 +3733,11 @@ async function log(message, data = {}){
 
 
 
+let guildMembersSimpleCache={at:0,items:[]};
 async function getGuildMembersSimple(){
+  if(guildMembersSimpleCache.items.length&&Date.now()-guildMembersSimpleCache.at<120000)return guildMembersSimpleCache.items;
   const guild = await client.guilds.fetch(CONFIG.guildId);
-  await guild.members.fetch();
+  if(!guild.members.cache.size) await guild.members.fetch();
   const members = [];
   guild.members.cache.forEach(member=>{
     if(member.user?.bot) return;
@@ -3761,7 +3763,9 @@ async function getGuildMembersSimple(){
       roles
     });
   });
-  return members.sort((a,b)=>String(a.nickname).localeCompare(String(b.nickname)));
+  const items=members.sort((a,b)=>String(a.nickname).localeCompare(String(b.nickname)));
+  guildMembersSimpleCache={at:Date.now(),items};
+  return items;
 }
 
 
@@ -3875,6 +3879,7 @@ app.get("/api/player-search", protect, async (req,res)=>{
           warningsClosed:Number(profile?.stats?.removedWarnings||0),
           farmApproved:farmReports.filter(r=>r.status==="approved").length,
           contractsCompleted:Number(profile?.stats?.contractCount||0),
+          captsPlayed:Number(profile?.stats?.capts||0),
           blacklist:blacklist.length,
           capts:capts.length
         }

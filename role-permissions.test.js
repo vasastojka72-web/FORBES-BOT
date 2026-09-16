@@ -18,6 +18,8 @@ for(const role of [CONFIG.roles.capper,CONFIG.roles.farmer,CONFIG.roles.buyout,C
 assert.deepEqual(parseForbesNickname("REV Aura Forbes"),{nick:"Aura",staticId:""});
 assert.deepEqual(parseForbesNickname("Rec | Aura Forbes | 28184"),{nick:"Aura",staticId:"28184"});
 assert.deepEqual(parseForbesNickname("CPT | Maksim_Hunter | 19962"),{nick:"Maksim_Hunter",staticId:"19962"});
+assert.deepEqual(parseForbesNickname("Head Cpt | Aura Forbes | 28184"),{nick:"Aura",staticId:"28184"});
+assert.deepEqual(parseForbesNickname("Head Cpt Aura Forbes | 28184"),{nick:"Aura",staticId:"28184"});
 for(const prefix of ["ADM","Rec","farm","cpt","Head Cpt","head cpt","dep cpt","farm manager"]){
   assert.deepEqual(parseForbesNickname(`${prefix} Aura Forbes`),{nick:"Aura",staticId:""});
 }

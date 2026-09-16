@@ -2619,16 +2619,7 @@ function publicMembersArray(db){
 
 /* === FORBES STATS PROFILES HALL OF FAME === */
 function parseMemberForbes(raw){
-  raw = String(raw || "").trim();
-  const parts = raw.split("|").map(x=>x.trim()).filter(Boolean);
-  let staticId = "";
-  let nick = raw;
-  for(const p of parts){ if(/^\d{1,10}$/.test(p)) staticId = p; }
-  const m = raw.match(/(.+?)\s*[|#]\s*(\d{1,10})\s*$/);
-  if(m){ nick = m[1].replace(/^(cpt|farm)\s*[|:-]\s*/i,"").trim(); staticId = m[2]; }
-  else if(parts.length >= 2){ nick = parts.find(p=>!/^\d{1,10}$/.test(p) && !/^(cpt|farm)$/i.test(p)) || parts[0]; }
-  nick = nick.replace(/^(cpt|farm)\s*[|:-]\s*/i,"").trim();
-  return {nick, staticId};
+  return parseForbesNickname(raw);
 }
 function statKeyFor(nick, id){
   return (String(id||"").trim() || String(nick||"").trim()).toLowerCase();
@@ -2739,6 +2730,7 @@ function buildMemberProfileFromDb(db, member){
 
   return {
     nick, staticId,
+    displayName: member.displayName || member.fullNickname || member.discordDisplayName || member.nickname || nick,
     discordId: member.discordId || member.id || "",
     username: member.username || "",
     avatar: member.avatar || "",
@@ -3742,7 +3734,7 @@ async function getGuildMembersSimple(){
   guild.members.cache.forEach(member=>{
     if(member.user?.bot) return;
     const display = member.displayName || member.user.username;
-    const parsed = parseForbesPlayerNameId(display);
+    const parsed = parseForbesNickname(display);
     const roles = member.roles.cache
       .filter(r => r.id !== CONFIG.guildId && r.name !== "@everyone")
       .map(r => ({id:r.id,name:r.name,position:Number(r.position||0)}))
@@ -3750,6 +3742,8 @@ async function getGuildMembersSimple(){
     members.push({
       discordUserId: member.id,
       discordId: member.id,
+      displayName: display,
+      fullNickname: display,
       nickname: parsed.nick,
       nick: parsed.nick,
       username: member.user.username,
@@ -3772,17 +3766,7 @@ async function getGuildMembersSimple(){
 
 /* === FORBES PLAYER SEARCH STATIC ID FINAL === */
 function parseForbesPlayerNameId(raw){
-  raw = String(raw || "").trim();
-  let nick = raw;
-  let staticId = "";
-  const parts = raw.split("|").map(x=>x.trim()).filter(Boolean);
-  const num = parts.find(x=>/^\d{1,10}$/.test(x));
-  if(num) staticId = num;
-  const possibleNick = parts.find(x=>!/^\d{1,10}$/.test(x) && !/^(cpt|farm|фарм|учасник)$/i.test(x));
-  if(possibleNick) nick = possibleNick;
-  const m = raw.match(/^(.+?)\s*(?:#|\||\[|\()\s*(\d{1,10})\s*(?:\]|\))?$/);
-  if(m){ nick = m[1].trim(); staticId = m[2].trim(); }
-  return {nick, staticId};
+  return parseForbesNickname(raw);
 }
 function playerFieldMatchesText(v,q){
   return String(v || "").toLowerCase().includes(String(q||"").toLowerCase());
@@ -3846,7 +3830,7 @@ app.get("/api/player-search", protect, async (req,res)=>{
     const primary=foundMembers[0]||null;
     const memberRef={
       id:primary?.discordUserId||"",discordId:primary?.discordUserId||"",username:primary?.username||"",
-      nickname:primary?.nickname||applications[0]?.nickname||q,staticId:primary?.staticId||applications[0]?.staticId||"",
+      nickname:primary?.nickname||applications[0]?.nickname||q,displayName:primary?.displayName||primary?.fullNickname||primary?.nickname||applications[0]?.nickname||q,staticId:primary?.staticId||applications[0]?.staticId||"",
       roles:primary?.roles||[],avatar:primary?.avatar||"",joinedAt:primary?.joinedAt||""
     };
     const profile=(primary||applications[0])?buildMemberProfileFromDb(db,memberRef):null;

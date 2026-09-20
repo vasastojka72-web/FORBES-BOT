@@ -1414,6 +1414,34 @@ app.delete("/api/contracts/:id", protect, ownerOnly, async (req,res)=>{
 
 
 // V25 — owner birthday management
+async function resolveBirthdayTarget(db,{nickname="",staticId="",fallbackDiscordId="",allowTargetLookup=false}={}){
+  const normalizedNickname=normalizeMemberNickname(nickname).toLowerCase();
+  const normalizedStaticId=normalizeGameId(staticId);
+  if(allowTargetLookup){
+    try{
+      const guildMembers=await getGuildMembersSimple();
+      const matched=guildMembers.find(member=>
+        (normalizedStaticId&&normalizeGameId(member.staticId||member.playerId)===normalizedStaticId)||
+        (normalizedNickname&&normalizeMemberNickname(member.nickname||member.nick).toLowerCase()===normalizedNickname)
+      );
+      if(matched){
+        const member=upsertCentralMember(db,{discordUserId:matched.discordUserId,nickname:matched.nickname,gameId:matched.staticId,avatar:matched.avatar,roles:matched.roles});
+        return {discordUserId:String(matched.discordUserId||""),memberId:String(member.memberId||""),discordName:String(matched.displayName||matched.username||"")};
+      }
+    }catch(error){
+      console.warn("birthday target lookup skipped",error?.message||error);
+    }
+    const central=findCentralMember(db,{gameId:normalizedStaticId,nickname:normalizedNickname});
+    const centralDiscordId=normalizeDiscordUserId(central?.discordUserId||central?.discord_user_id);
+    if(centralDiscordId){
+      return {discordUserId:centralDiscordId,memberId:String(central.memberId||central.member_id||central.id||""),discordName:""};
+    }
+  }
+  const fallbackId=normalizeDiscordUserId(fallbackDiscordId);
+  const member=upsertCentralMember(db,{discordUserId:fallbackId,nickname,gameId:staticId});
+  return {discordUserId:fallbackId,memberId:String(member.memberId||""),discordName:""};
+}
+
 app.get("/api/admin/birthdays", protect, ownerOnly, async (req,res)=>{
   try{
     const db=readDb();
@@ -1437,7 +1465,11 @@ app.put("/api/admin/birthdays/:id", protect, ownerOnly, async (req,res)=>{
     if(!nickname)return res.status(400).json({ok:false,error:"nickname_required",message:"Вкажи нік."});
     if(!staticId)return res.status(400).json({ok:false,error:"static_id_required",message:"Вкажи Static ID."});
     if(!Number.isInteger(day)||day<1||day>31||!Number.isInteger(month)||month<1||month>12||(year!==0&&(!Number.isInteger(year)||year<1940||year>new Date().getFullYear())))return res.status(400).json({ok:false,error:"invalid_birthday",message:"Вкажи правильні число та місяць. Рік — за бажанням."});
+    const target=await resolveBirthdayTarget(db,{nickname,staticId,fallbackDiscordId:item.discordUserId,allowTargetLookup:true});
     item.nickname=nickname; item.staticId=staticId; item.day=day; item.month=month; item.year=year;
+    if(target.discordUserId)item.discordUserId=target.discordUserId;
+    if(target.memberId)item.memberId=target.memberId;
+    if(target.discordName)item.discordName=target.discordName;
     item.enabled=req.body.enabled!==false; item.updatedAt=now(); item.updatedBy=String(req.user?.id||"");
     const wr=await writeDbAsync(db); if(!wr.ok)return res.status(500).json({ok:false,error:"birthday_db_write_failed",message:wr.error||"Не вдалося зберегти."});
     try{const ch=await channel(CONFIG.channels.birthdays);if(ch)await ch.send({embeds:[embed("✏️ День народження відредаговано",`**Нік:** ${item.nickname}
@@ -1471,10 +1503,13 @@ app.post("/api/birthdays", protect, async (req,res)=>{
     if(!staticId) return res.status(400).json({ok:false,error:"static_id_required",message:"Вкажи Static ID."});
     if(!Number.isInteger(day)||day<1||day>31||!Number.isInteger(month)||month<1||month>12||(year!==0&&(!Number.isInteger(year)||year<1940||year>new Date().getFullYear()))) return res.status(400).json({ok:false,error:"invalid_birthday",message:"Вкажи правильні число та місяць. Рік — за бажанням."});
     const db=readDb(); db.birthdays=Array.isArray(db.birthdays)?db.birthdays:[];
-    const discordId=String(req.user?.id||"");
-    const centralMember=upsertCentralMember(db,{discordUserId:discordId,nickname,gameId:staticId});
+    const actorDiscordId=String(req.user?.id||"");
+    const isOwner=actorDiscordId&&actorDiscordId===String(CONFIG.ownerId||"");
+    const target=await resolveBirthdayTarget(db,{nickname,staticId,fallbackDiscordId:actorDiscordId,allowTargetLookup:isOwner});
+    const discordId=target.discordUserId||actorDiscordId;
+    const centralMember=findCentralMember(db,{memberId:target.memberId})||upsertCentralMember(db,{discordUserId:discordId,nickname,gameId:staticId});
     const existing=db.birthdays.find(x=>discordId&&String(x.discordUserId||"")===discordId)||db.birthdays.find(x=>String(x.staticId||"")===staticId);
-    const birthday={id:existing?.id||id("birthday"),memberId:centralMember.memberId,nickname,staticId,discordUserId:discordId,discordName:req.user?.name||req.user?.username||"",day,month,year,enabled:true,createdAt:existing?.createdAt||now(),updatedAt:now()};
+    const birthday={id:existing?.id||id("birthday"),memberId:centralMember.memberId,nickname,staticId,discordUserId:discordId,discordName:target.discordName||req.user?.name||req.user?.username||"",day,month,year,enabled:true,createdAt:existing?.createdAt||now(),updatedAt:now()};
     if(existing)Object.assign(existing,birthday);else db.birthdays.unshift(birthday);
     const wr=typeof writeDbAsync==="function"?await writeDbAsync(db):(writeDb(db),{ok:true});
     if(!wr.ok)return res.status(500).json({ok:false,error:"birthday_db_write_failed",message:wr.error||"Не вдалося зберегти."});
@@ -1659,7 +1694,18 @@ app.get('/api/birthdays/today', async(req,res)=>{
     const d=pragueDateParts();
     const db=readDb();
     const viewer=String(req.query.viewerDiscordId||'');
-    const birthdays=(Array.isArray(db.birthdays)?db.birthdays:[]).filter(x=>x.enabled!==false&&Number(x.day)===d.day&&Number(x.month)===d.month).map(x=>({nickname:x.nickname,staticId:x.staticId,isViewer:Boolean(viewer&&String(x.discordUserId||'')===viewer)}));
+    const viewerGuildMember=viewer?client.guilds.cache.get(String(CONFIG.guildId))?.members.cache.get(viewer):null;
+    const viewerParsed=viewerGuildMember?parseForbesNickname(viewerGuildMember.displayName||viewerGuildMember.user?.username||''):null;
+    let repaired=false;
+    const birthdays=(Array.isArray(db.birthdays)?db.birthdays:[]).filter(x=>x.enabled!==false&&Number(x.day)===d.day&&Number(x.month)===d.month).map(x=>{
+      const sameDiscord=Boolean(viewer&&String(x.discordUserId||'')===viewer);
+      const sameStatic=Boolean(viewerParsed?.staticId&&normalizeGameId(x.staticId)===normalizeGameId(viewerParsed.staticId));
+      const sameNickname=Boolean(viewerParsed?.nick&&normalizeMemberNickname(x.nickname).toLowerCase()===normalizeMemberNickname(viewerParsed.nick).toLowerCase());
+      const isViewer=sameDiscord||sameStatic||sameNickname;
+      if(isViewer&&!sameDiscord&&viewer){x.discordUserId=viewer;x.updatedAt=now();repaired=true;}
+      return {nickname:x.nickname,staticId:x.staticId,isViewer};
+    });
+    if(repaired)await writeDbAsync(db);
     res.json({ok:true,date:d.key,birthdays,announcementsSent:result.sent,botReady:result.ready});
   }catch(e){console.error('birthday today failed',e);res.status(500).json({ok:false,error:'birthday_today_failed',message:e.message});}
 });

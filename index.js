@@ -5143,6 +5143,18 @@ app.post("/api/contracts", protect, ownerOnly, async (req,res)=>{
   }
 });
 
+function memberAutofillFullNickname(member){
+  const raw=String(member?.displayName||member?.fullNickname||member?.discordDisplayName||member?.nick||member?.nickname||"").trim();
+  const parts=raw.split("|").map(value=>value.trim()).filter(Boolean);
+  const textParts=parts.filter(value=>!/^\d{1,10}$/.test(value));
+  let nick=(parts.length>1?(textParts[textParts.length-1]||raw):raw)
+    .replace(/\s*(?:#|\[|\()\s*\d{1,10}\s*(?:\]|\))?\s*$/,'')
+    .replace(/^(?:(?:head|dep)\s+cpt|farm\s+manager|adm|rev|rec|farm|cpt)\s+/i,'')
+    .replace(/\s+/g,' ')
+    .trim();
+  return nick||normalizeMemberNickname(member?.nick||member?.nickname||"");
+}
+
 app.get("/api/members-autofill", async (req,res)=>{
   try{
     outboundMetrics.membersAutofillCalls++;
@@ -5163,8 +5175,8 @@ app.get("/api/members-autofill", async (req,res)=>{
         // cached central value replace the current server nickname.
         const dto={
           ...publicCentralMember(saved),
-          nick:normalizeMemberNickname(m.nick||m.nickname||saved.gameNickname),
-          nickname:normalizeMemberNickname(m.nick||m.nickname||saved.gameNickname),
+          nick:memberAutofillFullNickname(m),
+          nickname:memberAutofillFullNickname(m),
           staticId:normalizeGameId(m.staticId||m.playerId||saved.gameId),
           playerId:normalizeGameId(m.staticId||m.playerId||saved.gameId)
         };

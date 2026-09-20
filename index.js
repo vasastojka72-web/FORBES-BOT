@@ -1182,6 +1182,8 @@ async function getPublicMembersFromDiscord({fresh=false}={}){
         return {
           nick: parsed.nick,
           nickname: parsed.nick,
+          displayName: display,
+          fullNickname: display,
           username: m.user?.username || parsed.nick,
           discordUserId: m.id,
           discordId: m.id,

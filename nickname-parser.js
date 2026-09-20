@@ -12,8 +12,9 @@ export function parseForbesNickname(value){
     const match=raw.match(/^(.+?)\s*(?:#|\[|\()\s*(\d{1,10})\s*(?:\]|\))?$/);
     if(match){candidate=match[1].trim();numeric=match[2];}
   }
-  let words=candidate.replace(/\s+/g," ").trim().split(" ").filter(Boolean);
-  if(words.length>1&&/^forbes$/i.test(words.at(-1))) words.pop();
+  // Forbes is the in-game surname, not a disposable Discord suffix. Keep the
+  // complete "FirstName Forbes" value and remove only the service/rank prefix.
+  const words=candidate.replace(/\s+/g," ").trim().split(" ").filter(Boolean);
   let nick=words.join(" ").trim().replace(PREFIX_PATTERN,"").trim();
   return {nick:nick||candidate,staticId:numeric};
 }

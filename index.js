@@ -1861,7 +1861,7 @@ if(!memberHasRealServerRole(member)){
         `**У банк сімʼї 20%:** ${money(familyShare)}\n`+
         `**Гравцям 80%:** ${money(Math.floor(amount*0.8))}\n`+
         `**Кожному:** ${money(each)}\n`+
-        `**Гравці:** ${farmPlayersLabel}\n`+
+        `**Гравці:**\n${farmPlayersLabel}\n`+
         `**Коментар:** ${item.comment || "-"}`
       )],
       components
@@ -3495,8 +3495,17 @@ async function discordPlayerLabel(record={}, fallback="-"){
 async function formatFarmPlayersForDiscord(players=[]){
   if(!Array.isArray(players) || !players.length) return "-";
   const labels=[];
-  for(const p of players) labels.push(await discordPlayerLabel(p));
-  return labels.join(", ");
+  for(let index=0;index<players.length;index++){
+    const p=players[index]||{};
+    const member=await findDiscordMemberForRecord(p);
+    const gameNick=String(p.nickname||p.nick||p.player||p.name||"-").trim()||"-";
+    const discordId=String(member?.id||p.discordUserId||p.discordId||p.userId||"").trim();
+    const discordNick=String(member?.displayName||"").trim();
+    const discordLabel=discordId?`<@${discordId}>`:(discordNick||"Discord не знайдено");
+    const staticId=String(p.staticId||p.playerId||p.id||"").trim()||"-";
+    labels.push(`**Гравець ${index+1}:** ${gameNick} (${discordLabel}) | ID ${staticId}`);
+  }
+  return labels.join("\n");
 }
 
 async function resolveMemberLabel(userId){

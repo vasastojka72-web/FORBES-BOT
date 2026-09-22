@@ -15,6 +15,8 @@ import { compactResolvedDiscipline, disciplineCounters } from "./discipline-stat
 import {readDb, writeDb, writeDbAsync, id, initDb, getDbInfo, getStorageNetworkMetrics} from "./storage.js";
 import {ensureMediaSystem, uploadBase64Media, deleteMedia, getMediaPublicUrl, MEDIA_PATHS, mediaConfigured, downloadMedia} from "./media-storage.js";
 import { createDanceSyncManager } from "./dance-sync.js";
+import {applicationKind, isJoinApplication, applicationNeedsKick, kickApplicationAuthor} from "./application-policy.js";
+import {isOriginalFine, myPayableFines, validateFinePayment} from "./fine-payments.js";
 
 
 process.on("unhandledRejection", (err)=>console.error("UNHANDLED REJECTION:", err));
@@ -2312,6 +2314,15 @@ app.get("/api/fines", protect, async (req,res)=>{
   res.json({ok:true,fines:db.fines || []});
 });
 
+app.get("/api/fines/mine", protect, requireLauncherSession, async (req,res)=>{
+  try{
+    const member = await requireFamilyRole(req,res); if(!member) return;
+    const db = readDb();
+    if(backfillPublicNumbers(db,"fine",db.fines||[],isOriginalFine)) await writeDbAsync(db);
+    return res.json({ok:true,fines:myPayableFines(db,member)});
+  }catch(e){return res.status(500).json({ok:false,error:"my_fines_failed",message:"Не вдалося завантажити ваші штрафи."});}
+});
+
 app.get("/api/warnings", protect, async (req,res)=>{
   const member = await requireFamilyRole(req, res); if(!member) return;
   const db = readDb();
@@ -2389,56 +2400,66 @@ app.post("/api/fines", protect, async (req,res)=>{
     res.status(500).json({ok:false,error:"fine_create_failed",message:e.message});
   }
 });
-app.post("/api/fine-payments", protect, async (req,res)=>{
-  const member = await requireFamilyRole(req, res); if(!member) return;
-  const db=readDb();
-  const original = findByPublicOrInternalId((db.fines||[]).filter(f=>!f.fineId),req.body.fineId);
-  if(!original)return res.status(404).json({ok:false,error:"fine_not_found",message:"Штраф із таким номером не знайдено."});
-  let centralTarget=findCentralMember(db,{memberId:original?.targetMemberId,...req.body});
-  const targetMember=await findDiscordMemberForRecord(centralTarget||original||req.body||{});
-  if(!centralTarget&&targetMember)centralTarget=upsertCentralMember(db,{...(original||req.body),discordUserId:targetMember.id,nickname:targetMember.displayName});
-  const item={
-    id:nextSimpleId(db,"finepay",["fines","finePayments"]),
-    fineId:original.id,
-    fineDisplayNumber:original.displayNumber||original.publicNumber||req.body.fineId||"",
-    nickname:req.body.nickname||req.body.nick||"",
-    staticId:req.body.staticId||req.body.playerId||"",
-    screenshotUrl:safeRemoteMediaUrl(req.body.screenshotUrl),
-    targetMemberId:centralTarget?.memberId||original?.targetMemberId||"",
-    discordUserId:centralTarget?.discordUserId||targetMember?.id||original?.discordUserId||req.body.discordUserId||"",
-    status:"pending",
-    createdAt:now()
-  };
-
-  db.fines.unshift(item);
-
-  if(original && original.status !== "paid"){
-    original.status = "payment_pending";
-    original.paymentId = item.id;
+app.post("/api/fine-payments", protect, requireLauncherSession, async (req,res)=>{
+  try{
+    const member = await requireFamilyRole(req,res); if(!member) return;
+    const proof = screenshotAttachment(req.body,"fine-payment.png");
+    if(!proof || !proof.attachment?.length) return res.status(400).json({ok:false,error:"proof_required",message:proof?.tooLarge?"Скрін оплати завеликий. Максимум 7,8 МБ.":"Додай скрін оплати."});
+    const ch = await channel(CONFIG.channels.finePayments);
+    if(!ch) return res.status(503).json({ok:false,error:"payment_channel_unavailable",message:"Канал перевірки оплат недоступний. Спробуй пізніше."});
+    const db=readDb();
+    const original = findByPublicOrInternalId((db.fines||[]).filter(isOriginalFine),req.body.fineId);
+    const problem = validateFinePayment(db,original,member);
+    if(problem) return res.status(problem.status).json({ok:false,...problem});
+    // Identity and amount come exclusively from the issued fine and the authenticated member.
+    const item={
+      id:nextSimpleId(db,"finepay",["fines","finePayments"]),
+      fineId:original.id,
+      fineDisplayNumber:original.displayNumber||original.publicNumber||original.id,
+      nickname:original.nickname||original.nick||"",
+      staticId:original.staticId||original.playerId||"",
+      amount:Number(original.amount||0), reason:original.reason||"",
+      targetMemberId:original.targetMemberId||findCentralMember(db,{discordUserId:member.id})?.memberId||"",
+      discordUserId:member.id, submittedByDiscordId:member.id,
+      status:"pending", discordStatus:"sending", createdAt:now()
+    };
+    const oldStatus=original.status, oldPaymentId=original.paymentId;
+    db.fines.unshift(item);
+    original.status="payment_pending";
+    original.paymentId=item.id;
+    const saved=await writeDbAsync(db);
+    if(!saved.ok){
+      db.fines=db.fines.filter(f=>f!==item); original.status=oldStatus; original.paymentId=oldPaymentId;
+      await writeDbAsync(db);
+      return res.status(503).json({ok:false,error:"payment_save_failed",message:"Не вдалося зберегти оплату. Спробуй ще раз."});
+    }
+    try{
+      const sent=await ch.send({
+        content:`<@${member.id}>`, allowedMentions:{users:[member.id]},
+        embeds:[embed("💳 Оплата штрафу на перевірку",
+          `**Оплата №:** ${item.id}\n**Штраф №:** ${item.fineDisplayNumber}\n**Гравець:** ${item.nickname} | ${item.staticId} (<@${member.id}>)\n**Сума:** ${money(item.amount)}\n**Причина:** ${item.reason}`)],
+        files:[proof],
+        components:[row([
+          {id:`finepay_approve:${item.id}`,label:"✅ Одобрити оплату",style:ButtonStyle.Success},
+          {id:`finepay_reject:${item.id}`,label:"❌ Відхилити",style:ButtonStyle.Danger}
+        ])]
+      });
+      item.discordStatus="sent"; item.discordMessageId=sent.id;
+    }catch(error){
+      item.status="delivery_failed"; item.discordStatus="failed";
+      original.status="unpaid"; delete original.paymentId;
+      await writeDbAsync(db);
+      console.error("fine payment delivery failed",error);
+      return res.status(502).json({ok:false,error:"payment_delivery_failed",message:"Discord не прийняв оплату. Спробуй надіслати ще раз."});
+    }
+    await writeDbAsync(db);
+    return res.json({ok:true,payment:item,discordSent:true});
+  }catch(e){
+    console.error("fine payment failed",e);
+    return res.status(500).json({ok:false,error:"fine_payment_failed",message:"Не вдалося надіслати оплату. Онови список штрафів перед повтором."});
   }
-
-  await writeDbAsync(db);
-
-  const ch=await channel(CONFIG.channels.finePayments);
-  const paymentPlayerLabel=await discordPlayerLabel(item);
-  if(ch) await sendWithOptionalScreenshot(ch, {
-    content:item.discordUserId?`<@${item.discordUserId}>`:undefined,
-    allowedMentions:{users:item.discordUserId?[item.discordUserId]:[]},
-    embeds:[embed("💳 Оплата штрафу на перевірку",
-      `**Оплата №:** ${item.id}
-` +
-      `**Штраф №:** ${item.fineDisplayNumber}
-` +
-      `**Гравець:** ${paymentPlayerLabel}`
-    )],
-    components:[row([
-      {id:`finepay_approve:${item.id}`,label:"✅ Одобрити оплату",style:ButtonStyle.Success},
-      {id:`finepay_reject:${item.id}`,label:"❌ Відхилити",style:ButtonStyle.Danger}
-    ])]
-  }, req.body, "fine-payment.png");
-
-  res.json({ok:true,payment:item});
 });
+
 app.post("/api/warnings", protect, async (req,res)=>{
   try{
     const member=await requireFamilyRole(req,res); if(!member)return;
@@ -3163,6 +3184,54 @@ async function finishReviewButton(interaction, payload){
   return interaction.update(payload);
 }
 
+const applicationReviewsInFlight = new Set();
+async function reviewApplicationDecision(interaction, member, action, itemId){
+  if(applicationReviewsInFlight.has(itemId)) return reviewButtonError(interaction,"⏳ Ця заявка вже обробляється.");
+  applicationReviewsInFlight.add(itemId);
+  try{
+    const db=readDb();
+    const application=(db.applications||[]).find(x=>String(x.id)===String(itemId));
+    if(!application) return reviewButtonError(interaction,"❌ Заявку не знайдено.");
+    const isDismiss=applicationKind(application.type)==="dismissal";
+    const allowed=isDismiss?hasPermission(member,"FULL_ADMIN"):canModerateApplications(member,interaction);
+    if(!allowed) return denyNoPerm(interaction,isDismiss?"❌ Увал можуть одобряти тільки Лідер, Зам.лідера або Права рука.":"❌ Недостатньо прав для перевірки заявок.");
+    if(application.status!=="pending") return reviewButtonError(interaction,`ℹ️ Заявка вже оброблена: ${application.status}`);
+    const before={...application};
+    application.status=action==="app_approve"?"approved":"rejected";
+    application.reviewedBy=interaction.user.id; application.reviewedAt=now();
+    // Save the decision before any irreversible Discord action.
+    const saved=await writeDbAsync(db);
+    if(!saved.ok){
+      Object.keys(application).forEach(key=>delete application[key]); Object.assign(application,before);
+      await writeDbAsync(db);
+      return reviewButtonError(interaction,"❌ Рішення не збережено. Учасника не кікнуто. Спробуйте ще раз.");
+    }
+    let resultText="";
+    if(action==="app_approve" && isJoinApplication(application.type)){
+      try{const result=await applyApplicationApprove(application);resultText=result.ok?`\n✅ Роль видана, нік встановлено: **${result.nickname}**`:`\n⚠️ Роль/нік не видано: ${result.reason}`;}
+      catch(e){resultText="\n⚠️ Бот не зміг видати роль або змінити нік.";}
+    }
+    if(applicationNeedsKick(application,action)){
+      try{
+        const guild=await client.guilds.fetch(CONFIG.guildId);
+        application.kickResult=await kickApplicationAuthor(application,action,guild,interaction.user.id);
+      }catch(e){application.kickResult={status:"failed",reason:String(e.message||e).slice(0,250)};}
+      const result=application.kickResult;
+      resultText+=result.status==="kicked"?"\n✅ Автора заявки кікнуто з Discord.":result.status==="already_absent"?"\nℹ️ Автор заявки вже відсутній на сервері.":`\n⚠️ Рішення збережено, але кік не виконано: ${result.reason} Потрібна дія адміністратора.`;
+    }
+    addUserNotification(db,{
+      discordUserId:application.discordUserId||application.userId,
+      type:"application_status", title:application.status==="approved"?"Заявку схвалено":"Заявку відхилено",
+      message:`Заявка ${application.id} ${application.status==="approved"?"схвалена":"відхилена"}.`,
+      entityType:"application", entityId:application.id
+    });
+    const finalSave=await writeDbAsync(db);
+    if(!finalSave.ok) resultText+="\n⚠️ Не вдалося синхронізувати результат із базою. Перевірте журнал бота.";
+    return finishReviewButton(interaction,{content:`Заявку ${application.status==="approved"?"✅ одобрено":"❌ відхилено"} модератором ${interaction.user}.${resultText}`,components:[],embeds:interaction.message.embeds,allowedMentions:{parse:[]}});
+  }finally{applicationReviewsInFlight.delete(itemId);}
+}
+
+
 client.on("interactionCreate", async interaction=>{
   try{
     if(interaction.isChatInputCommand()){
@@ -3219,38 +3288,9 @@ client.on("interactionCreate", async interaction=>{
       return interaction.reply({content:"✅ Тебе додано до розіграшу!",ephemeral:true});
     }
 
-    // ЗАЯВКИ: права залежать від типу заявки
+    // Only application buttons may trigger an application kick.
     if(action==="app_approve"||action==="app_reject"){
-      const app=db.applications.find(x=>x.id===itemId);
-      if(!app) return reviewButtonError(interaction,"❌ Заявку не знайдено.");
-      const type=String(app.type||"").toLowerCase();
-      const isDismiss=type.includes("увал")||type.includes("звіль")||type==="dismissal";
-      const allowed=isDismiss
-        ? hasPermission(member,"FULL_ADMIN")
-        : canModerateApplications(member,interaction);
-      if(!allowed){
-        return denyNoPerm(interaction,isDismiss
-          ? "❌ Увал можуть одобряти тільки Лідер, Зам.лідера або Права рука."
-          : "❌ Заявку можуть одобряти Лідер, Зам, Права рука, Старший каптер або Фарм менеджер.");
-      }
-      if(app.status!=="pending") return reviewButtonError(interaction,`ℹ️ Заявка вже оброблена: ${app.status}`);
-      app.status = action==="app_approve" ? "approved" : "rejected";
-      app.reviewedBy=interaction.user.id; app.reviewedAt=now();
-      let resultText="";
-      const roleApplication=!(type.includes("відпуст")||type.includes("увал")||type.includes("звіль"));
-      if(action==="app_approve" && roleApplication){
-        try{const result=await applyApplicationApprove(app);resultText=result.ok?`\n✅ Роль видана, нік встановлено: **${result.nickname}**`:`\n⚠️ Роль/нік не видано: ${result.reason}`;}catch(e){resultText="\n⚠️ Бот не зміг видати роль або змінити нік.";}
-      }
-      addUserNotification(db, {
-        discordUserId: app.discordUserId || app.userId,
-        type: "application_status",
-        title: app.status === "approved" ? "Заявку схвалено" : "Заявку відхилено",
-        message: `Заявка ${app.id} ${app.status === "approved" ? "схвалена" : "відхилена"}.`,
-        entityType: "application",
-        entityId: app.id
-      });
-      await writeDbAsync(db);
-      return finishReviewButton(interaction,{content:`Заявку ${app.status==="approved"?"✅ одобрено":"❌ відхилено"} модератором ${interaction.user}.${resultText}`,components:[],embeds:interaction.message.embeds});
+      return await reviewApplicationDecision(interaction,member,action,itemId);
     }
 
     // ФАРМ-ЗВІТИ: тільки Лідер / Зам / Права рука / Фарм менеджер
@@ -3364,18 +3404,22 @@ client.on("interactionCreate", async interaction=>{
         return denyNoPerm(interaction, "❌ Оплату штрафів можуть одобряти тільки Лідер, Зам.лідера або Права рука.");
       }
 
-      const p=db.fines.find(x=>x.id===itemId);
+      const p=db.fines.find(x=>x.id===itemId && x.fineId);
       if(!p) return reviewButtonError(interaction,"❌ Не знайдено оплату штрафу.");
-      if(["paid","rejected"].includes(String(p.status))) return reviewButtonError(interaction,"ℹ️ Цю оплату вже оброблено.");
+      if(!["pending","payment_pending"].includes(String(p.status))) return reviewButtonError(interaction,"ℹ️ Цю оплату вже оброблено або не доставлено.");
+
+      const original = db.fines.find(x => String(x.id) === String(p.fineId) && isOriginalFine(x));
+      if(!original || ["paid","closed"].includes(original.status)) return reviewButtonError(interaction,"ℹ️ Штраф уже закрито або видалено.");
+      if(original.paymentId && String(original.paymentId)!==String(p.id)) return reviewButtonError(interaction,"ℹ️ Для цього штрафу є новіша оплата. Перевірте її.");
 
       p.status=action==="finepay_approve"?"paid":"rejected";
       p.reviewedBy=interaction.user.id;
       p.reviewedAt=now();
 
-      const original = db.fines.find(x => x.id === p.fineId);
       if(original){
         original.status = action==="finepay_approve" ? "paid" : "unpaid";
         if(action==="finepay_approve") original.paidAt = now();
+        else delete original.paymentId;
       }
 
       addUserNotification(db,{

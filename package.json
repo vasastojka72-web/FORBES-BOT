@@ -9,7 +9,8 @@
     "test:dance": "node dance-sync.test.js",
     "test:roles": "node role-permissions.test.js",
     "test:lifetime": "node lifetime-stats.test.js",
-    "test:discipline": "node discipline-stats.test.js"
+    "test:discipline": "node discipline-stats.test.js",
+    "test:fines-applications": "node --test fines-applications.test.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

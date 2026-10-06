@@ -15,8 +15,6 @@ import { compactResolvedDiscipline, disciplineCounters } from "./discipline-stat
 import {readDb, writeDb, writeDbAsync, id, initDb, getDbInfo, getStorageNetworkMetrics} from "./storage.js";
 import {ensureMediaSystem, uploadBase64Media, deleteMedia, getMediaPublicUrl, MEDIA_PATHS, mediaConfigured, downloadMedia} from "./media-storage.js";
 import { createDanceSyncManager } from "./dance-sync.js";
-import {applicationKind, isJoinApplication, applicationNeedsKick, kickApplicationAuthor} from "./application-policy.js";
-import {isOriginalFine, myPayableFines, validateFinePayment} from "./fine-payments.js";
 
 
 process.on("unhandledRejection", (err)=>console.error("UNHANDLED REJECTION:", err));
@@ -198,6 +196,31 @@ function addUserNotification(db, notification = {}){
   return item;
 }
 
+function warningExpiryTime(warning={}){
+  const direct=Date.parse(String(warning.expiresAt||warning.expires_at||""));
+  if(Number.isFinite(direct))return direct;
+  const legacy=String(warning.until||"").trim().match(/^(\d{1,2})[.\/-](\d{1,2})[.\/-](\d{4})$/);
+  if(!legacy)return NaN;
+  return Date.UTC(Number(legacy[3]),Number(legacy[2])-1,Number(legacy[1]),21,0,0,0);
+}
+function expireActiveWarnings(db,at=Date.now()){
+  db.warnings=Array.isArray(db.warnings)?db.warnings:[];
+  let changed=0;
+  for(const warning of db.warnings){
+    if(String(warning?.status||"active").toLowerCase()!=="active")continue;
+    const expiresAt=warningExpiryTime(warning);
+    if(!Number.isFinite(expiresAt)||expiresAt>at)continue;
+    warning.status="expired";
+    warning.autoRemoved=true;
+    warning.removedAt=new Date(at).toISOString();
+    warning.closedAt=warning.removedAt;
+    warning.removalReason="Строк дії догани завершився автоматично";
+    addUserNotification(db,{recipientMemberId:warning.targetMemberId,discordUserId:warning.discordUserId,type:"warning_expired",title:"Догану автоматично знято",message:`Догана ${warning.displayNumber||warning.publicNumber||warning.id||""} більше не активна: строк дії завершився.`,entityType:"warning",entityId:warning.id});
+    changed++;
+  }
+  return changed;
+}
+
 function normalizeDiscordUserId(value){
   const id=String(value||"").replace(/\D/g,"");
   return /^\d{15,25}$/.test(id)?id:"";
@@ -293,7 +316,7 @@ const DEFAULT_NOTIFICATION_PREFERENCES = Object.freeze({
 function notificationPreferenceKey(type){
   const value=String(type||"");
   if(value==="farm_report_status"||value==="farm_report_approved"||value==="farm_report_rejected")return "farmReports";
-  if(value==="warning_created")return "warnings";
+  if(value==="warning_created"||value==="warning_expired")return "warnings";
   if(value==="fine_created")return "fines";
   if(value.startsWith("fine_payment_")||value.startsWith("warning_payment_")||value==="fine_payment_status"||value==="warning_payment_status")return "paymentApprovals";
   if(value==="capt_created"||value==="capt_registered")return "capts";
@@ -688,6 +711,7 @@ app.get("/api/launcher/notifications", protect, requireForbesMembership, async (
   const limit = Math.min(Math.max(Number(req.query.limit || 50), 1), 100);
   const since = String(req.query.since || "");
   const db = readDb();
+  const expiredWarnings=expireActiveWarnings(db);
   const currentMember=findCentralMember(db,{discordUserId});
   const currentRoleIds=new Set(await currentLauncherRoleIds(req));
   const belongsToCurrent=item=>{
@@ -708,7 +732,7 @@ app.get("/api/launcher/notifications", protect, requireForbesMembership, async (
       addUserNotification(db,{recipientMemberId:currentMember?.memberId,discordUserId,type:"fine_created",title:"Новий штраф",message:`${fine.reason||"Без причини"}. Сума: ${money(fine.amount||0)}.`,entityType:"fine",entityId:fine.id});
   }
   for(const warning of (Array.isArray(db.warnings) ? db.warnings : [])){
-    if(belongsToCurrent(warning))
+    if(belongsToCurrent(warning)&&["active","remove_pending"].includes(String(warning.status||"active").toLowerCase()))
       addUserNotification(db,{recipientMemberId:currentMember?.memberId,discordUserId,type:"warning_created",title:"Нова догана",message:warning.reason||"Причину не вказано.",entityType:"warning",entityId:warning.id});
   }
   for(const report of (Array.isArray(db.farmReports) ? db.farmReports : [])){
@@ -722,7 +746,7 @@ app.get("/api/launcher/notifications", protect, requireForbesMembership, async (
     const registered=(Array.isArray(capt.participants)?capt.participants:[]).some(belongsToCurrent);
     if(registered) addUserNotification(db,{recipientMemberId:currentMember?.memberId,discordUserId,type:"capt_registered",title:"Ви записані на капт",message:`${capt.date||"Дата не вказана"} о ${capt.time||"--:--"}. Проти: ${capt.enemy||"не вказано"}.`,entityType:"capt",entityId:capt.id});
   }
-  if((db.notifications||[]).length!==beforeMaterialize) await writeDbAsync(db);
+  if((db.notifications||[]).length!==beforeMaterialize||expiredWarnings) await writeDbAsync(db);
   let notifications = (Array.isArray(db.notifications) ? db.notifications : [])
     .filter(belongsToCurrent);
   // Site announcements belong in the regular Launcher notification feed.
@@ -782,10 +806,16 @@ app.get("/api/launcher/statistics", protect, requireForbesMembership, (req,res)=
     return res.status(401).json({ok:false,error:"auth_required",message:"Discord authorization is required."});
   }
   const db = readDb();
+  if(expireActiveWarnings(db))writeDb(db);
   const belongsToUser = item => {
-    if(String(item?.discordUserId || item?.userId || "") === discordUserId) return true;
-    return (Array.isArray(item?.players) ? item.players : []).some(player =>
+    const players = Array.isArray(item?.players) ? item.players : [];
+    // A report author is not necessarily one of the paid players. For current
+    // reports the participants list is the salary source of truth. Keep the
+    // top-level id only as a compatibility fallback for old reports that did
+    // not store participant records yet.
+    if(players.length) return players.some(player =>
       String(player?.discordUserId || player?.userId || "") === discordUserId);
+    return String(item?.discordUserId || item?.userId || "") === discordUserId;
   };
   const approvedReports = (Array.isArray(db.farmReports) ? db.farmReports : [])
     .filter(report => report.status === "approved" && belongsToUser(report));
@@ -812,7 +842,7 @@ app.get("/api/launcher/statistics", protect, requireForbesMembership, (req,res)=
       finesAmount:fines.reduce((sum,item)=>sum+Number(item.amount||item.sum||item.price||0),0),
       finesUnpaid:fines.filter(item=>!["paid","closed"].includes(String(item.status))).length,
       warningsTotal:warnings.length,
-      warningsActive:warnings.filter(item=>!["removed","closed"].includes(String(item.status))).length
+      warningsActive:warnings.filter(item=>["active","remove_pending"].includes(String(item.status||"active").toLowerCase())).length
     },
     serverTime:new Date().toISOString()
   });
@@ -2314,20 +2344,34 @@ app.get("/api/fines", protect, async (req,res)=>{
   res.json({ok:true,fines:db.fines || []});
 });
 
-app.get("/api/fines/mine", protect, requireLauncherSession, async (req,res)=>{
-  try{
-    const member = await requireFamilyRole(req,res); if(!member) return;
-    const db = readDb();
-    if(backfillPublicNumbers(db,"fine",db.fines||[],isOriginalFine)) await writeDbAsync(db);
-    return res.json({ok:true,fines:myPayableFines(db,member)});
-  }catch(e){return res.status(500).json({ok:false,error:"my_fines_failed",message:"Не вдалося завантажити ваші штрафи."});}
-});
-
 app.get("/api/warnings", protect, async (req,res)=>{
   const member = await requireFamilyRole(req, res); if(!member) return;
   const db = readDb();
-  if(backfillPublicNumbers(db,"warning",db.warnings||[]))await writeDbAsync(db);
+  const expired=expireActiveWarnings(db);
+  if(backfillPublicNumbers(db,"warning",db.warnings||[])||expired)await writeDbAsync(db);
   res.json({ok:true,warnings:db.warnings || []});
+});
+
+app.get("/api/my-discipline",protect,async(req,res)=>{
+  const member=await requireFamilyRole(req,res);if(!member)return;
+  const db=readDb();
+  const expired=expireActiveWarnings(db);
+  if(expired)await writeDbAsync(db);
+  const discordUserId=String(req.user?.id||"");
+  const central=findCentralMember(db,{discordUserId});
+  const belongs=item=>{
+    if(discordUserId&&String(item?.discordUserId||item?.recipientDiscordUserId||"")===discordUserId)return true;
+    if(central?.memberId&&String(item?.targetMemberId||item?.memberId||"")===String(central.memberId))return true;
+    const itemGameId=normalizeGameId(item?.staticId||item?.playerId||item?.gameId);
+    const userGameId=normalizeGameId(central?.gameId||central?.staticId);
+    if(itemGameId&&userGameId&&itemGameId===userGameId)return true;
+    const itemNick=normalizeMemberNickname(item?.nickname||item?.nick).toLowerCase();
+    const userNick=normalizeMemberNickname(central?.gameNickname||central?.nickname).toLowerCase();
+    return Boolean(itemNick&&userNick&&itemNick===userNick);
+  };
+  const fines=(db.fines||[]).filter(item=>belongs(item)&&!String(item.id||"").startsWith("finepay_")&&!['paid','closed'].includes(String(item.status||'unpaid').toLowerCase()));
+  const warnings=(db.warnings||[]).filter(item=>belongs(item)&&['active','remove_pending'].includes(String(item.status||'active').toLowerCase()));
+  res.json({ok:true,fines,warnings,serverTime:new Date().toISOString()});
 });
 
 app.post("/api/fines", protect, async (req,res)=>{
@@ -2400,66 +2444,56 @@ app.post("/api/fines", protect, async (req,res)=>{
     res.status(500).json({ok:false,error:"fine_create_failed",message:e.message});
   }
 });
-app.post("/api/fine-payments", protect, requireLauncherSession, async (req,res)=>{
-  try{
-    const member = await requireFamilyRole(req,res); if(!member) return;
-    const proof = screenshotAttachment(req.body,"fine-payment.png");
-    if(!proof || !proof.attachment?.length) return res.status(400).json({ok:false,error:"proof_required",message:proof?.tooLarge?"Скрін оплати завеликий. Максимум 7,8 МБ.":"Додай скрін оплати."});
-    const ch = await channel(CONFIG.channels.finePayments);
-    if(!ch) return res.status(503).json({ok:false,error:"payment_channel_unavailable",message:"Канал перевірки оплат недоступний. Спробуй пізніше."});
-    const db=readDb();
-    const original = findByPublicOrInternalId((db.fines||[]).filter(isOriginalFine),req.body.fineId);
-    const problem = validateFinePayment(db,original,member);
-    if(problem) return res.status(problem.status).json({ok:false,...problem});
-    // Identity and amount come exclusively from the issued fine and the authenticated member.
-    const item={
-      id:nextSimpleId(db,"finepay",["fines","finePayments"]),
-      fineId:original.id,
-      fineDisplayNumber:original.displayNumber||original.publicNumber||original.id,
-      nickname:original.nickname||original.nick||"",
-      staticId:original.staticId||original.playerId||"",
-      amount:Number(original.amount||0), reason:original.reason||"",
-      targetMemberId:original.targetMemberId||findCentralMember(db,{discordUserId:member.id})?.memberId||"",
-      discordUserId:member.id, submittedByDiscordId:member.id,
-      status:"pending", discordStatus:"sending", createdAt:now()
-    };
-    const oldStatus=original.status, oldPaymentId=original.paymentId;
-    db.fines.unshift(item);
-    original.status="payment_pending";
-    original.paymentId=item.id;
-    const saved=await writeDbAsync(db);
-    if(!saved.ok){
-      db.fines=db.fines.filter(f=>f!==item); original.status=oldStatus; original.paymentId=oldPaymentId;
-      await writeDbAsync(db);
-      return res.status(503).json({ok:false,error:"payment_save_failed",message:"Не вдалося зберегти оплату. Спробуй ще раз."});
-    }
-    try{
-      const sent=await ch.send({
-        content:`<@${member.id}>`, allowedMentions:{users:[member.id]},
-        embeds:[embed("💳 Оплата штрафу на перевірку",
-          `**Оплата №:** ${item.id}\n**Штраф №:** ${item.fineDisplayNumber}\n**Гравець:** ${item.nickname} | ${item.staticId} (<@${member.id}>)\n**Сума:** ${money(item.amount)}\n**Причина:** ${item.reason}`)],
-        files:[proof],
-        components:[row([
-          {id:`finepay_approve:${item.id}`,label:"✅ Одобрити оплату",style:ButtonStyle.Success},
-          {id:`finepay_reject:${item.id}`,label:"❌ Відхилити",style:ButtonStyle.Danger}
-        ])]
-      });
-      item.discordStatus="sent"; item.discordMessageId=sent.id;
-    }catch(error){
-      item.status="delivery_failed"; item.discordStatus="failed";
-      original.status="unpaid"; delete original.paymentId;
-      await writeDbAsync(db);
-      console.error("fine payment delivery failed",error);
-      return res.status(502).json({ok:false,error:"payment_delivery_failed",message:"Discord не прийняв оплату. Спробуй надіслати ще раз."});
-    }
-    await writeDbAsync(db);
-    return res.json({ok:true,payment:item,discordSent:true});
-  }catch(e){
-    console.error("fine payment failed",e);
-    return res.status(500).json({ok:false,error:"fine_payment_failed",message:"Не вдалося надіслати оплату. Онови список штрафів перед повтором."});
-  }
-});
+app.post("/api/fine-payments", protect, async (req,res)=>{
+  const member = await requireFamilyRole(req, res); if(!member) return;
+  const db=readDb();
+  const original = findByPublicOrInternalId((db.fines||[]).filter(f=>!f.fineId),req.body.fineId);
+  if(!original)return res.status(404).json({ok:false,error:"fine_not_found",message:"Штраф із таким номером не знайдено."});
+  let centralTarget=findCentralMember(db,{memberId:original?.targetMemberId,...req.body});
+  const targetMember=await findDiscordMemberForRecord(centralTarget||original||req.body||{});
+  if(!centralTarget&&targetMember)centralTarget=upsertCentralMember(db,{...(original||req.body),discordUserId:targetMember.id,nickname:targetMember.displayName});
+  const item={
+    id:nextSimpleId(db,"finepay",["fines","finePayments"]),
+    fineId:original.id,
+    fineDisplayNumber:original.displayNumber||original.publicNumber||req.body.fineId||"",
+    nickname:req.body.nickname||req.body.nick||"",
+    staticId:req.body.staticId||req.body.playerId||"",
+    screenshotUrl:safeRemoteMediaUrl(req.body.screenshotUrl),
+    targetMemberId:centralTarget?.memberId||original?.targetMemberId||"",
+    discordUserId:centralTarget?.discordUserId||targetMember?.id||original?.discordUserId||req.body.discordUserId||"",
+    status:"pending",
+    createdAt:now()
+  };
 
+  db.fines.unshift(item);
+
+  if(original && original.status !== "paid"){
+    original.status = "payment_pending";
+    original.paymentId = item.id;
+  }
+
+  await writeDbAsync(db);
+
+  const ch=await channel(CONFIG.channels.finePayments);
+  const paymentPlayerLabel=await discordPlayerLabel(item);
+  if(ch) await sendWithOptionalScreenshot(ch, {
+    content:item.discordUserId?`<@${item.discordUserId}>`:undefined,
+    allowedMentions:{users:item.discordUserId?[item.discordUserId]:[]},
+    embeds:[embed("💳 Оплата штрафу на перевірку",
+      `**Оплата №:** ${item.id}
+` +
+      `**Штраф №:** ${item.fineDisplayNumber}
+` +
+      `**Гравець:** ${paymentPlayerLabel}`
+    )],
+    components:[row([
+      {id:`finepay_approve:${item.id}`,label:"✅ Одобрити оплату",style:ButtonStyle.Success},
+      {id:`finepay_reject:${item.id}`,label:"❌ Відхилити",style:ButtonStyle.Danger}
+    ])]
+  }, req.body, "fine-payment.png");
+
+  res.json({ok:true,payment:item});
+});
 app.post("/api/warnings", protect, async (req,res)=>{
   try{
     const member=await requireFamilyRole(req,res); if(!member)return;
@@ -2537,7 +2571,8 @@ app.post("/api/warning-payments", protect, async (req,res)=>{
 });
 app.get("/api/warnings", protect, async (req,res)=>{
   const db = readDb();
-  if(backfillPublicNumbers(db,"warning",db.warnings||[]))await writeDbAsync(db);
+  const expired=expireActiveWarnings(db);
+  if(backfillPublicNumbers(db,"warning",db.warnings||[])||expired)await writeDbAsync(db);
   res.json({ok:true,warnings:db.warnings || []});
 });
 
@@ -3184,54 +3219,6 @@ async function finishReviewButton(interaction, payload){
   return interaction.update(payload);
 }
 
-const applicationReviewsInFlight = new Set();
-async function reviewApplicationDecision(interaction, member, action, itemId){
-  if(applicationReviewsInFlight.has(itemId)) return reviewButtonError(interaction,"⏳ Ця заявка вже обробляється.");
-  applicationReviewsInFlight.add(itemId);
-  try{
-    const db=readDb();
-    const application=(db.applications||[]).find(x=>String(x.id)===String(itemId));
-    if(!application) return reviewButtonError(interaction,"❌ Заявку не знайдено.");
-    const isDismiss=applicationKind(application.type)==="dismissal";
-    const allowed=isDismiss?hasPermission(member,"FULL_ADMIN"):canModerateApplications(member,interaction);
-    if(!allowed) return denyNoPerm(interaction,isDismiss?"❌ Увал можуть одобряти тільки Лідер, Зам.лідера або Права рука.":"❌ Недостатньо прав для перевірки заявок.");
-    if(application.status!=="pending") return reviewButtonError(interaction,`ℹ️ Заявка вже оброблена: ${application.status}`);
-    const before={...application};
-    application.status=action==="app_approve"?"approved":"rejected";
-    application.reviewedBy=interaction.user.id; application.reviewedAt=now();
-    // Save the decision before any irreversible Discord action.
-    const saved=await writeDbAsync(db);
-    if(!saved.ok){
-      Object.keys(application).forEach(key=>delete application[key]); Object.assign(application,before);
-      await writeDbAsync(db);
-      return reviewButtonError(interaction,"❌ Рішення не збережено. Учасника не кікнуто. Спробуйте ще раз.");
-    }
-    let resultText="";
-    if(action==="app_approve" && isJoinApplication(application.type)){
-      try{const result=await applyApplicationApprove(application);resultText=result.ok?`\n✅ Роль видана, нік встановлено: **${result.nickname}**`:`\n⚠️ Роль/нік не видано: ${result.reason}`;}
-      catch(e){resultText="\n⚠️ Бот не зміг видати роль або змінити нік.";}
-    }
-    if(applicationNeedsKick(application,action)){
-      try{
-        const guild=await client.guilds.fetch(CONFIG.guildId);
-        application.kickResult=await kickApplicationAuthor(application,action,guild,interaction.user.id);
-      }catch(e){application.kickResult={status:"failed",reason:String(e.message||e).slice(0,250)};}
-      const result=application.kickResult;
-      resultText+=result.status==="kicked"?"\n✅ Автора заявки кікнуто з Discord.":result.status==="already_absent"?"\nℹ️ Автор заявки вже відсутній на сервері.":`\n⚠️ Рішення збережено, але кік не виконано: ${result.reason} Потрібна дія адміністратора.`;
-    }
-    addUserNotification(db,{
-      discordUserId:application.discordUserId||application.userId,
-      type:"application_status", title:application.status==="approved"?"Заявку схвалено":"Заявку відхилено",
-      message:`Заявка ${application.id} ${application.status==="approved"?"схвалена":"відхилена"}.`,
-      entityType:"application", entityId:application.id
-    });
-    const finalSave=await writeDbAsync(db);
-    if(!finalSave.ok) resultText+="\n⚠️ Не вдалося синхронізувати результат із базою. Перевірте журнал бота.";
-    return finishReviewButton(interaction,{content:`Заявку ${application.status==="approved"?"✅ одобрено":"❌ відхилено"} модератором ${interaction.user}.${resultText}`,components:[],embeds:interaction.message.embeds,allowedMentions:{parse:[]}});
-  }finally{applicationReviewsInFlight.delete(itemId);}
-}
-
-
 client.on("interactionCreate", async interaction=>{
   try{
     if(interaction.isChatInputCommand()){
@@ -3288,9 +3275,38 @@ client.on("interactionCreate", async interaction=>{
       return interaction.reply({content:"✅ Тебе додано до розіграшу!",ephemeral:true});
     }
 
-    // Only application buttons may trigger an application kick.
+    // ЗАЯВКИ: права залежать від типу заявки
     if(action==="app_approve"||action==="app_reject"){
-      return await reviewApplicationDecision(interaction,member,action,itemId);
+      const app=db.applications.find(x=>x.id===itemId);
+      if(!app) return reviewButtonError(interaction,"❌ Заявку не знайдено.");
+      const type=String(app.type||"").toLowerCase();
+      const isDismiss=type.includes("увал")||type.includes("звіль")||type==="dismissal";
+      const allowed=isDismiss
+        ? hasPermission(member,"FULL_ADMIN")
+        : canModerateApplications(member,interaction);
+      if(!allowed){
+        return denyNoPerm(interaction,isDismiss
+          ? "❌ Увал можуть одобряти тільки Лідер, Зам.лідера або Права рука."
+          : "❌ Заявку можуть одобряти Лідер, Зам, Права рука, Старший каптер або Фарм менеджер.");
+      }
+      if(app.status!=="pending") return reviewButtonError(interaction,`ℹ️ Заявка вже оброблена: ${app.status}`);
+      app.status = action==="app_approve" ? "approved" : "rejected";
+      app.reviewedBy=interaction.user.id; app.reviewedAt=now();
+      let resultText="";
+      const roleApplication=!(type.includes("відпуст")||type.includes("увал")||type.includes("звіль"));
+      if(action==="app_approve" && roleApplication){
+        try{const result=await applyApplicationApprove(app);resultText=result.ok?`\n✅ Роль видана, нік встановлено: **${result.nickname}**`:`\n⚠️ Роль/нік не видано: ${result.reason}`;}catch(e){resultText="\n⚠️ Бот не зміг видати роль або змінити нік.";}
+      }
+      addUserNotification(db, {
+        discordUserId: app.discordUserId || app.userId,
+        type: "application_status",
+        title: app.status === "approved" ? "Заявку схвалено" : "Заявку відхилено",
+        message: `Заявка ${app.id} ${app.status === "approved" ? "схвалена" : "відхилена"}.`,
+        entityType: "application",
+        entityId: app.id
+      });
+      await writeDbAsync(db);
+      return finishReviewButton(interaction,{content:`Заявку ${app.status==="approved"?"✅ одобрено":"❌ відхилено"} модератором ${interaction.user}.${resultText}`,components:[],embeds:interaction.message.embeds});
     }
 
     // ФАРМ-ЗВІТИ: тільки Лідер / Зам / Права рука / Фарм менеджер
@@ -3404,22 +3420,18 @@ client.on("interactionCreate", async interaction=>{
         return denyNoPerm(interaction, "❌ Оплату штрафів можуть одобряти тільки Лідер, Зам.лідера або Права рука.");
       }
 
-      const p=db.fines.find(x=>x.id===itemId && x.fineId);
+      const p=db.fines.find(x=>x.id===itemId);
       if(!p) return reviewButtonError(interaction,"❌ Не знайдено оплату штрафу.");
-      if(!["pending","payment_pending"].includes(String(p.status))) return reviewButtonError(interaction,"ℹ️ Цю оплату вже оброблено або не доставлено.");
-
-      const original = db.fines.find(x => String(x.id) === String(p.fineId) && isOriginalFine(x));
-      if(!original || ["paid","closed"].includes(original.status)) return reviewButtonError(interaction,"ℹ️ Штраф уже закрито або видалено.");
-      if(original.paymentId && String(original.paymentId)!==String(p.id)) return reviewButtonError(interaction,"ℹ️ Для цього штрафу є новіша оплата. Перевірте її.");
+      if(["paid","rejected"].includes(String(p.status))) return reviewButtonError(interaction,"ℹ️ Цю оплату вже оброблено.");
 
       p.status=action==="finepay_approve"?"paid":"rejected";
       p.reviewedBy=interaction.user.id;
       p.reviewedAt=now();
 
+      const original = db.fines.find(x => x.id === p.fineId);
       if(original){
         original.status = action==="finepay_approve" ? "paid" : "unpaid";
         if(action==="finepay_approve") original.paidAt = now();
-        else delete original.paymentId;
       }
 
       addUserNotification(db,{
@@ -4335,6 +4347,9 @@ client.once("ready", async()=>{
   setInterval(()=>processDiscordQueue(10).catch(console.error), 60 * 1000);
   restoreCaptReminderTimers();
   setInterval(()=>checkCaptReminders().catch(console.error), 60 * 1000);
+  const expireWarningsNow=async()=>{const db=readDb();const count=expireActiveWarnings(db);if(count){await writeDbAsync(db);console.log(`[WARNINGS] Automatically expired: ${count}`);}};
+  await expireWarningsNow().catch(console.error);
+  setInterval(()=>expireWarningsNow().catch(console.error),60*60*1000);
 
   try{
     await sendSystemBackup();

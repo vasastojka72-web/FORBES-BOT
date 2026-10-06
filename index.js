@@ -1588,6 +1588,27 @@ app.post("/api/birthdays", protect, async (req,res)=>{
   }catch(e){console.error("birthday post failed",e);res.status(500).json({ok:false,error:"birthday_post_failed",message:e.message})}
 });
 
+app.get("/api/applications", protect, (req,res)=>{
+  try{
+    const db=readDb();
+    const all=Array.isArray(db.applications)?db.applications:[];
+    const userId=String(req.user?.id||"");
+    if(!userId||req.user?.guest)return res.json({ok:true,applications:[]});
+
+    // Senior roles can review every application. Ordinary users receive only
+    // their own records; the frontend is not treated as a security boundary.
+    const cachedMember=client.guilds.cache.get(String(CONFIG.guildId))?.members.cache.get(userId);
+    const tokenMember={id:userId,roles:Array.isArray(req.user?.roles)?req.user.roles:[]};
+    const canReview=canModerateApplications(cachedMember||tokenMember,req);
+    const applications=(canReview?all:all.filter(item=>String(item?.discordUserId||item?.userId||"")===userId))
+      .slice().sort((a,b)=>Date.parse(b?.createdAt||0)-Date.parse(a?.createdAt||0));
+    res.json({ok:true,applications});
+  }catch(e){
+    console.error("GET /api/applications failed:",e);
+    res.status(500).json({ok:false,error:"applications_fetch_failed",message:e.message});
+  }
+});
+
 app.post("/api/applications", protect, async (req,res)=>{
   try{
     const db=readDb();

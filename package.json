@@ -5,11 +5,7 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node index.js",
-    "test:dance": "node dance-sync.test.js",
-    "test:roles": "node role-permissions.test.js",
-    "test:lifetime": "node lifetime-stats.test.js",
-    "test:discipline": "node discipline-stats.test.js"
+    "start": "node index.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
@@ -17,8 +13,7 @@
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "node-cron": "^3.0.3",
-    "@supabase/supabase-js": "^2.48.1",
-    "ws": "^8.18.0"
+    "@supabase/supabase-js": "^2.48.1"
   },
   "engines": {
     "node": ">=18"

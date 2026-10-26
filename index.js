@@ -1401,6 +1401,23 @@ app.post("/api/birthdays", protect, async (req,res)=>{
   }catch(e){console.error("birthday post failed",e);res.status(500).json({ok:false,error:"birthday_post_failed",message:e.message})}
 });
 
+app.get("/api/applications", protect, (req,res)=>{
+  try{
+    const db=readDb();
+    const all=Array.isArray(db.applications)?db.applications:[];
+    const userId=String(req.user?.id||"");
+    if(!userId||req.user?.guest)return res.json({ok:true,applications:[]});
+    const cachedMember=client.guilds.cache.get(String(CONFIG.guildId))?.members.cache.get(userId);
+    const tokenMember={id:userId,roles:Array.isArray(req.user?.roles)?req.user.roles:[]};
+    const canReview=canModerateApplications(cachedMember||tokenMember,req);
+    const applications=(canReview?all:all.filter(item=>String(item?.discordUserId||item?.userId||"")===userId))
+      .slice().sort((a,b)=>Date.parse(b?.createdAt||0)-Date.parse(a?.createdAt||0));
+    res.json({ok:true,applications});
+  }catch(e){
+    console.error("GET /api/applications failed:",e);
+    res.status(500).json({ok:false,error:"applications_fetch_failed",message:e.message});
+  }
+});
 app.post("/api/applications", protect, async (req,res)=>{
   try{
     const db=readDb();
@@ -2143,6 +2160,33 @@ app.get("/api/warnings", protect, async (req,res)=>{
   res.json({ok:true,warnings:db.warnings || []});
 });
 
+app.get("/api/my-discipline",protect,async(req,res)=>{
+  const member=await requireFamilyRole(req,res);if(!member)return;
+  const db=readDb();
+  db.warnings=Array.isArray(db.warnings)?db.warnings:[];
+  let changed=false;
+  for(const warning of db.warnings){
+    const status=String(warning?.status||"active").toLowerCase();
+    const expiresAt=Date.parse(warning?.expiresAt||"");
+    if(status==="active"&&Number.isFinite(expiresAt)&&expiresAt<=Date.now()){warning.status="expired";warning.expiredAt=new Date().toISOString();changed=true;}
+  }
+  if(changed)await writeDbAsync(db);
+  const discordUserId=String(req.user?.id||"");
+  const central=findCentralMember(db,{discordUserId});
+  const belongs=item=>{
+    if(discordUserId&&String(item?.discordUserId||item?.recipientDiscordUserId||"")===discordUserId)return true;
+    if(central?.memberId&&String(item?.targetMemberId||item?.memberId||"")===String(central.memberId))return true;
+    const itemGameId=normalizeGameId(item?.staticId||item?.playerId||item?.gameId);
+    const userGameId=normalizeGameId(central?.gameId||central?.staticId);
+    if(itemGameId&&userGameId&&itemGameId===userGameId)return true;
+    const itemNick=normalizeMemberNickname(item?.nickname||item?.nick).toLowerCase();
+    const userNick=normalizeMemberNickname(central?.gameNickname||central?.nickname).toLowerCase();
+    return Boolean(itemNick&&userNick&&itemNick===userNick);
+  };
+  const fines=(Array.isArray(db.fines)?db.fines:[]).filter(item=>belongs(item)&&!String(item.id||"").startsWith("finepay_")&&!["paid","closed"].includes(String(item.status||"unpaid").toLowerCase()));
+  const warnings=db.warnings.filter(item=>belongs(item)&&["active","remove_pending"].includes(String(item.status||"active").toLowerCase()));
+  res.json({ok:true,fines,warnings,serverTime:new Date().toISOString()});
+});
 app.post("/api/fines", protect, async (req,res)=>{
   try{
     const member = await requireFamilyRole(req, res);

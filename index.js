@@ -2797,10 +2797,12 @@ function nicknameForApplication(app){
 }
 
 async function applyApplicationApprove(app){
-    if(!app || !app.discordUserId) return {ok:false, reason:"no_discord_user_id"};
+    const result={ok:false,partial:false,nickname:"",roleId:"",roleName:"",roleAdded:false,nicknameChanged:false,roleError:"",nicknameError:"",reason:""};
+    const discordUserId=String(app?.discordUserId||app?.userId||app?.discordId||"").match(/\d{16,22}/)?.[0]||"";
+    if(!app || !discordUserId){result.roleError="У заявці немає Discord ID";result.nicknameError="У заявці немає Discord ID";result.reason="no_discord_user_id";return result;}
     const guild = await client.guilds.fetch(CONFIG.guildId);
-    const member = await guild.members.fetch(app.discordUserId).catch(()=>null);
-    if(!member) return {ok:false, reason:"member_not_found"};
+    const member = await guild.members.fetch(discordUserId).catch(()=>null);
+    if(!member){result.roleError="Користувача немає на сервері";result.nicknameError="Користувача немає на сервері";result.reason="member_not_found";return result;}
     const { roleId, roleKey } = roleForApplicationType(app.type);
     await guild.roles.fetch().catch(()=>null);
     const configuredName=String(CONFIG.roleNames?.[roleKey]||"").trim().toLowerCase();
@@ -2809,22 +2811,26 @@ async function applyApplicationApprove(app){
     const role=guild.roles.cache.get(String(roleId||"")) || guild.roles.cache.find(item=>wantedNames.has(String(item.name||"").trim().toLowerCase()));
     let roleAdded=false, nicknameChanged=false, roleError="", nicknameError="";
     if(!role){
-      roleError=`role_not_found:${roleKey}`;
+      roleError=`роль не знайдена (${roleKey}, ID ${roleId||"не задано"})`;
       console.error("Application role not found",{type:app.type,configuredRoleId:roleId,roleKey});
+    }else if(member.roles.cache.has(role.id)){
+      roleAdded=true;
     }else if(!role.editable){
-      roleError=`role_not_editable:${role.name}`;
+      roleError=`роль «${role.name}» знаходиться вище або на одному рівні з роллю бота`;
       console.error("Application role is not editable by bot",{roleId:role.id,roleName:role.name,botHighest:guild.members.me?.roles?.highest?.name});
     }else{
       try{ await member.roles.add(role,`Application ${app.id||""} approved`); roleAdded=true; }
-      catch(e){ roleError=`role_add_failed:${e?.message||e}`; console.error("Role add failed:",e); }
+      catch(e){ roleError=`Discord відхилив роль: ${e?.message||e}`; console.error("Role add failed:",e); }
     }
     const newNick = nicknameForApplication(app);
-    if(!member.manageable){
-      nicknameError="member_not_manageable";
+    if(member.nickname===newNick){
+      nicknameChanged=true;
+    }else if(!member.manageable){
+      nicknameError="нік не можна змінити: найвища роль користувача не нижча за роль бота або це власник сервера";
       console.error("Application member is not manageable by bot",{memberId:member.id,displayName:member.displayName,highestRole:member.roles.highest?.name});
     }else{
       try{ await member.setNickname(newNick,`Application ${app.id||""} approved`); nicknameChanged=true; }
-      catch(e){ nicknameError=`nickname_failed:${e?.message||e}`; console.error("Nickname set failed:",e); }
+      catch(e){ nicknameError=`Discord відхилив зміну ніку: ${e?.message||e}`; console.error("Nickname set failed:",e); }
     }
     return {ok:roleAdded&&nicknameChanged,partial:roleAdded||nicknameChanged,nickname:newNick,
       roleId:role?.id||roleId||"",roleName:role?.name||CONFIG.roleNames?.[roleKey]||roleKey,
@@ -3065,14 +3071,15 @@ client.on("interactionCreate", async interaction=>{
           : "❌ Заявку можуть одобряти Лідер, Зам, Права рука, Старший каптер або Фарм менеджер.");
       }
       if(app.status!=="pending") return reviewButtonError(interaction,`ℹ️ Заявка вже оброблена: ${app.status}`);
-      app.status = action==="app_approve" ? "approved" : "rejected";
       app.reviewedBy=interaction.user.id; app.reviewedAt=now();
       let resultText="";
       const roleApplication=!(type.includes("відпуст")||type.includes("увал")||type.includes("звіль"));
+      let discordApplied=true;
       if(action==="app_approve" && roleApplication){
-        try{const result=await applyApplicationApprove(app);const parts=[];parts.push(result.roleAdded?`✅ Роль **${result.roleName}** видана.`:`⚠️ Роль не видана: ${result.roleError||"невідома помилка"}`);parts.push(result.nicknameChanged?`✅ Нік встановлено: **${result.nickname}**`:`⚠️ Нік не змінено: ${result.nicknameError||"невідома помилка"}`);resultText="\n"+parts.join("\n");}catch(e){console.error("Application approve failed:",e);resultText=`\n⚠️ Помилка Discord: ${e?.message||e}`;}
+        try{const result=await applyApplicationApprove(app);discordApplied=result.ok;const parts=[];parts.push(result.roleAdded?`✅ Роль **${result.roleName}** видана.`:`⚠️ Роль не видана: ${result.roleError||result.reason||"невідома помилка"}`);parts.push(result.nicknameChanged?`✅ Нік встановлено: **${result.nickname}**`:`⚠️ Нік не змінено: ${result.nicknameError||result.reason||"невідома помилка"}`);if(!result.ok)parts.push("🔁 Заявка залишена в очікуванні — виправте причину та натисніть **Одобрити** ще раз.");resultText="\n"+parts.join("\n");}catch(e){discordApplied=false;console.error("Application approve failed:",e);resultText=`\n⚠️ Помилка Discord: ${e?.message||e}\n🔁 Заявка залишена в очікуванні для повторної спроби.`;}
       }
-      addUserNotification(db, {
+      app.status = action==="app_reject" ? "rejected" : (discordApplied ? "approved" : "pending");
+      if(app.status!=="pending") addUserNotification(db, {
         discordUserId: app.discordUserId || app.userId,
         type: "application_status",
         title: app.status === "approved" ? "Заявку схвалено" : "Заявку відхилено",
@@ -3081,7 +3088,9 @@ client.on("interactionCreate", async interaction=>{
         entityId: app.id
       });
       await writeDbAsync(db);
-      return finishReviewButton(interaction,{content:`Заявку ${app.status==="approved"?"✅ одобрено":"❌ відхилено"} модератором ${interaction.user}.${resultText}`,components:[],embeds:interaction.message.embeds});
+      const retryComponents=app.status==="pending"?interaction.message.components:[];
+      const statusLabel=app.status==="approved"?"✅ одобрено":app.status==="rejected"?"❌ відхилено":"⚠️ поки не одобрено";
+      return finishReviewButton(interaction,{content:`Заявку ${statusLabel} модератором ${interaction.user}.${resultText}`,components:retryComponents,embeds:interaction.message.embeds});
     }
 
     // ФАРМ-ЗВІТИ: тільки Лідер / Зам / Права рука / Фарм менеджер

@@ -7,12 +7,12 @@ export const CONFIG = {
   // Discord role IDs from your FORBES server. Names here match your Discord roles.
   roles: {
     bot: "1504883501978095657",             // 🤖 BOT / FORBES BOT
-    member: "1504870552152571954",         // Учасник
-    newbie: "1504870592162168843",         // новобранець
-    farmer: "1504870952880701592",         // Фармер
+    member: process.env.MEMBER_ROLE_ID || "1553153161554952263", // Учасник
+    newbie: "1504870592162168843",         // Боржник
+    farmer: process.env.FARMER_ROLE_ID || "1504870952880701592", // Фармер
     farmManager: "1504871085223706664",    // Фарм менеджер
-    fighter: "1504871275917738066",        // Боєць
-    capt: "1504871411230179359",           // Каптер
+    fighter: "1504871275917738066",        // Відкуп
+    capt: process.env.CAPT_ROLE_ID || "1504871411230179359",     // Каптер
     seniorCapt: "1504871617543536782",     // Старший каптер
     rightHand: "1504871693397790871",      // Права рука
     deputy: "1504871859261538425"          // Зам.лідера
@@ -21,10 +21,10 @@ export const CONFIG = {
   roleNames: {
     bot: "BOT / FORBES BOT",
     member: "Учасник",
-    newbie: "новобранець",
+    newbie: "Боржник",
     farmer: "Фармер",
     farmManager: "Фарм менеджер",
-    fighter: "Боєць",
+    fighter: "Відкуп",
     capt: "Каптер",
     seniorCapt: "Старший каптер",
     rightHand: "Права рука",

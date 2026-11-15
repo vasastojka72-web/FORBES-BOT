@@ -2805,14 +2805,26 @@ async function applyApplicationApprove(app){
     if(!member){result.roleError="Користувача немає на сервері";result.nicknameError="Користувача немає на сервері";result.reason="member_not_found";return result;}
     const { roleId, roleKey } = roleForApplicationType(app.type);
     await guild.roles.fetch().catch(()=>null);
-    const configuredName=String(CONFIG.roleNames?.[roleKey]||"").trim().toLowerCase();
+    const normalizeRoleName=value=>String(value||"").toLowerCase().normalize("NFKD")
+      .replace(/[’'`ʼ]/g,"").replace(/[^a-zа-яіїєґ0-9]+/giu," ").trim();
+    const configuredName=normalizeRoleName(CONFIG.roleNames?.[roleKey]||"");
     const aliases={member:["учасник","member"],farmer:["фармер","farmer"],capt:["каптер","capt","cpt"]};
-    const wantedNames=new Set([configuredName,...(aliases[roleKey]||[])].filter(Boolean));
-    const role=guild.roles.cache.get(String(roleId||"")) || guild.roles.cache.find(item=>wantedNames.has(String(item.name||"").trim().toLowerCase()));
+    const wantedNames=[configuredName,...(aliases[roleKey]||[]).map(normalizeRoleName)].filter(Boolean);
+    const byConfiguredId=guild.roles.cache.get(String(roleId||""));
+    const candidates=[...guild.roles.cache.values()].filter(item=>{
+      if(!item || item.managed || item.id===guild.id) return false;
+      const name=normalizeRoleName(item.name);
+      return wantedNames.some(wanted=>name===wanted || name.startsWith(wanted+" ") || name.endsWith(" "+wanted) || name.includes(" "+wanted+" "));
+    }).sort((a,b)=>{
+      const an=normalizeRoleName(a.name),bn=normalizeRoleName(b.name);
+      const ae=wantedNames.includes(an)?1:0,be=wantedNames.includes(bn)?1:0;
+      return be-ae || a.position-b.position;
+    });
+    const role=byConfiguredId || candidates.find(item=>item.editable) || candidates[0];
     let roleAdded=false, nicknameChanged=false, roleError="", nicknameError="";
     if(!role){
       roleError=`роль не знайдена (${roleKey}, ID ${roleId||"не задано"})`;
-      console.error("Application role not found",{type:app.type,configuredRoleId:roleId,roleKey});
+      console.error("Application role not found",{type:app.type,configuredRoleId:roleId,roleKey,wantedNames,availableRoles:[...guild.roles.cache.values()].map(r=>({id:r.id,name:r.name,editable:r.editable}))});
     }else if(member.roles.cache.has(role.id)){
       roleAdded=true;
     }else if(!role.editable){

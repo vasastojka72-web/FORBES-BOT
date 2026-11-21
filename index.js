@@ -562,9 +562,11 @@ function canCaptAll(member,req){
     || userHasAnyRole(member, [
       CONFIG.roles.leader,
       CONFIG.roles.owner,
+      CONFIG.roles.leader2,
       CONFIG.roles.deputy,
       CONFIG.roles.rightHand,
-      CONFIG.roles.seniorCapt
+      CONFIG.roles.seniorCapt,
+      CONFIG.roles.deputySeniorCapt
     ])
     || _hasAnyRole(member,["лідер","leader","зам","права рука","старший каптер"]);
 }
@@ -1900,7 +1902,7 @@ async function requireCaptManagerFromRequest(req, res){
     console.warn("CAPT ACTION DENIED", {
       userId: member.id,
       roles: getMemberRoleIds(member),
-      allowed: [CONFIG.roles.leader,CONFIG.roles.owner,CONFIG.roles.deputy,CONFIG.roles.rightHand,CONFIG.roles.seniorCapt].filter(Boolean)
+      allowed: [CONFIG.roles.leader,CONFIG.roles.owner,CONFIG.roles.leader2,CONFIG.roles.deputy,CONFIG.roles.rightHand,CONFIG.roles.seniorCapt,CONFIG.roles.deputySeniorCapt].filter(Boolean)
     });
     res.status(403).json({ok:false,error:"no_permission",message:"Недостатньо прав. Потрібна роль Старший каптер / Права рука / Зам / Лідер."});
     return null;
@@ -1920,7 +1922,7 @@ app.post("/api/capts", protect, async (req,res)=>{
       console.warn("CAPT CREATE DENIED", {
         userId: member.id,
         roles: member.roles?.cache ? Array.from(member.roles.cache.keys()) : [],
-        allowed: [CONFIG.roles.leader, CONFIG.roles.owner, CONFIG.roles.deputy, CONFIG.roles.rightHand, CONFIG.roles.seniorCapt].filter(Boolean)
+        allowed: [CONFIG.roles.leader, CONFIG.roles.owner, CONFIG.roles.leader2, CONFIG.roles.deputy, CONFIG.roles.rightHand, CONFIG.roles.seniorCapt, CONFIG.roles.deputySeniorCapt].filter(Boolean)
       });
       return res.status(403).json({ok:false,error:"no_permission",message:"Запит на капт можуть робити тільки Старший каптер / Права рука / Зам.лідера / Лідер."});
     }
@@ -2981,6 +2983,7 @@ function canManage(member){
   return userHasAnyRole(member, [
     CONFIG.roles.leader,
     CONFIG.roles.owner,
+    CONFIG.roles.leader2,
     CONFIG.roles.deputy,
     CONFIG.roles.rightHand
   ]);
@@ -2997,9 +3000,11 @@ function canUseCaptSignup(member){
   return userHasAnyRole(member, [
     CONFIG.roles.leader,
     CONFIG.roles.owner,
+    CONFIG.roles.leader2,
     CONFIG.roles.deputy,
     CONFIG.roles.rightHand,
     CONFIG.roles.seniorCapt,
+    CONFIG.roles.deputySeniorCapt,
     CONFIG.roles.capt
   ]);
 }
@@ -3009,15 +3014,17 @@ function canModerateFarmReports(member){ return forbes2026Farm(member,null); }
 function canModerateWarningsAndFines(member){ return forbes2026Discipline(member,null); }
 
 function canModerateApplications(member,req){
-  return forbes2026Full(member,req)||forbes2026HasId(member,[FORBES_ACCESS_ROLE_IDS_2026.farmManager,FORBES_ACCESS_ROLE_IDS_2026.seniorCapt,CONFIG.roles.farmManager,CONFIG.roles.seniorCapt])||forbes2026HasName(member,["фарм менеджер","старший каптер"]);
+  return forbes2026Full(member,req)||forbes2026HasId(member,[FORBES_ACCESS_ROLE_IDS_2026.farmManager,FORBES_ACCESS_ROLE_IDS_2026.seniorCapt,FORBES_ACCESS_ROLE_IDS_2026.deputySeniorCapt,CONFIG.roles.farmManager,CONFIG.roles.seniorCapt,CONFIG.roles.deputySeniorCapt])||forbes2026HasName(member,["фарм менеджер","head capt","dep head capt"]);
 }
 function canManageBlacklist(member){
   return userHasAnyRole(member, [
     CONFIG.roles.leader,
     CONFIG.roles.owner,
+    CONFIG.roles.leader2,
     CONFIG.roles.deputy,
     CONFIG.roles.rightHand,
-    CONFIG.roles.seniorCapt
+    CONFIG.roles.seniorCapt,
+    CONFIG.roles.deputySeniorCapt
   ]);
 }
 
@@ -3162,7 +3169,7 @@ client.on("interactionCreate", async interaction=>{
       const type=String(app.type||"").toLowerCase();
       const isDismiss=type.includes("увал")||type.includes("звіль")||type==="dismissal";
       const allowed=isDismiss
-        ? userHasAnyRole(member,[CONFIG.roles.leader,CONFIG.roles.owner,CONFIG.roles.deputy,CONFIG.roles.rightHand])
+        ? userHasAnyRole(member,[CONFIG.roles.leader,CONFIG.roles.owner,CONFIG.roles.leader2,CONFIG.roles.deputy,CONFIG.roles.rightHand])
         : canModerateApplications(member,interaction);
       if(!allowed){
         return denyNoPerm(interaction,isDismiss
@@ -4557,7 +4564,7 @@ app.post("/api/announcements", protect, async (req,res)=>{
     const seniorCategories={
       all:{title:"👥 Повідомлення для всіх",label:"Для всіх",channelId:CONFIG.channels.generalChat,targetType:"ALL",roleIds:[]},
       farm:{title:"🌾 Повідомлення для фарму",label:"Фарм",channelId:CONFIG.channels.seniorFarmMessages,targetType:"ROLES",roleIds:[CONFIG.roles.farmer,CONFIG.roles.farmManager].map(String).filter(Boolean)},
-      capt:{title:"⚔️ Повідомлення для капту",label:"Капт",channelId:CONFIG.channels.seniorCaptMessages,targetType:"ROLES",roleIds:[CONFIG.roles.capt,CONFIG.roles.seniorCapt].map(String).filter(Boolean)}
+      capt:{title:"⚔️ Повідомлення для капту",label:"Капт",channelId:CONFIG.channels.seniorCaptMessages,targetType:"ROLES",roleIds:[CONFIG.roles.capt,CONFIG.roles.seniorCapt,CONFIG.roles.deputySeniorCapt].map(String).filter(Boolean)}
     };
     const announcementCategories={
       all:{title:"📢 Загальне оголошення",label:"Загальне",channelId:CONFIG.channels.announcements,targetType:"ALL",roleIds:[]},
@@ -4641,7 +4648,7 @@ app.post("/api/announcements-legacy", protect, async (req,res)=>{
   try{
     const annMember=await apiMemberFromRequest(req);
     const annType=String(req.body.type||"all").toLowerCase();
-    const canGeneral=_mainId(req)||userHasAnyRole(annMember,[CONFIG.roles.deputy,CONFIG.roles.rightHand]);
+    const canGeneral=_mainId(req)||userHasAnyRole(annMember,[CONFIG.roles.boss,CONFIG.roles.leader2,CONFIG.roles.deputy,CONFIG.roles.rightHand]);
     const canFarm=canGeneral||forbes2026Farm(annMember,req)||userHasAnyRole(annMember,[CONFIG.roles.farmManager]);
     if(annType==="farm" ? !canFarm : !canGeneral) return res.status(403).json({ok:false,error:"no_permission",message:"Немає прав."});
     const db=readDb();
@@ -5207,7 +5214,7 @@ function finalHas(member,ids,names){const rs=finalRoles(member);return rs.some(r
 function finalOwner(req){return _mainId(req);}
 async function finalMember(req){return apiMemberFromRequest(req);}
 async function finalCanContent(req){return finalOwner(req);}
-async function finalCanFarmAnn(req){if(finalOwner(req))return true;const m=await finalMember(req);return finalHas(m,[CONFIG.roles.deputy,CONFIG.roles.rightHand,CONFIG.roles.farmManager],["зам","права рука","фарм менеджер"]);}
+async function finalCanFarmAnn(req){if(finalOwner(req))return true;const m=await finalMember(req);return finalHas(m,[CONFIG.roles.boss,CONFIG.roles.leader2,CONFIG.roles.deputy,CONFIG.roles.rightHand,CONFIG.roles.farmManager],["boss","лідер 2","зам лідера","фарм менеджер"]);}
 function backupMedia(db,type,payload,action="update"){db.mediaBackups=Array.isArray(db.mediaBackups)?db.mediaBackups:[];db.mediaBackups.unshift({id:id("backup"),type,action,payload:JSON.parse(JSON.stringify(payload||null)),createdAt:new Date().toISOString()});db.mediaBackups=db.mediaBackups.slice(0,200);}
 function mediaDb(db){db.galleryAlbums=Array.isArray(db.galleryAlbums)?db.galleryAlbums:[];db.musicTracks=Array.isArray(db.musicTracks)?db.musicTracks:[];db.cars=Array.isArray(db.cars)?db.cars:[];db.estate=db.estate||{title:"Фото маєтку",description:"",photos:[]};db.office=db.office||{title:"Офіс",description:"",photos:[]};db.familyHistory=db.familyHistory||{title:"Історія сім’ї",text:"",photos:[]};db.leadership=Array.isArray(db.leadership)?db.leadership:[];db.mediaBackups=Array.isArray(db.mediaBackups)?db.mediaBackups:[];return db;}
 app.get("/api/v2/content", async (req,res)=>{
@@ -5375,11 +5382,13 @@ app.delete("/api/complaints/:id", protect, async(req,res)=>{
 
 /* === FORBES CENTRAL ROLE MATRIX 2026 === */
 const FORBES_ACCESS_ROLE_IDS_2026 = Object.freeze({
+  boss: "1549814900963016805",
   leader2: "1504871859261538425",
   deputy: "1504871693397790871",
   farmManager: "1504871085223706664",
   complaintAdmin: "1527167132696313866",
-  seniorCapt: "1504871617543536782"
+  seniorCapt: "1504871617543536782",
+  deputySeniorCapt: "1549097790456467660"
 });
 function forbes2026RoleIds(member){
   try{ if(member?.roles?.cache) return Array.from(member.roles.cache.keys()).map(String); if(Array.isArray(member?.roles)) return member.roles.map(r=>String(r?.id||r||"")); }catch(e){} return [];
@@ -5394,9 +5403,9 @@ function forbes2026HasName(member,names){
   return have.some(role=>want.some(name=>role===name||role.includes(name)));
 }
 function forbes2026Main(req){ try{ if(typeof _mainId==='function'&&_mainId(req))return true; if(typeof forbesMainIdFromReq==='function'&&forbesMainIdFromReq(req))return true; }catch(e){} return false; }
-function forbes2026Full(member,req){ return forbes2026Main(req)||forbes2026HasId(member,[FORBES_ACCESS_ROLE_IDS_2026.leader2,FORBES_ACCESS_ROLE_IDS_2026.deputy]); }
+function forbes2026Full(member,req){ return forbes2026Main(req)||forbes2026HasId(member,[FORBES_ACCESS_ROLE_IDS_2026.boss,FORBES_ACCESS_ROLE_IDS_2026.leader2,FORBES_ACCESS_ROLE_IDS_2026.deputy]); }
 function forbes2026Farm(member,req){ return forbes2026Full(member,req)||forbes2026HasId(member,[FORBES_ACCESS_ROLE_IDS_2026.farmManager]); }
-function forbes2026Capt(member,req){ return forbes2026Full(member,req)||forbes2026HasId(member,[FORBES_ACCESS_ROLE_IDS_2026.seniorCapt,CONFIG.roles.seniorCapt]); }
+function forbes2026Capt(member,req){ return forbes2026Full(member,req)||forbes2026HasId(member,[FORBES_ACCESS_ROLE_IDS_2026.seniorCapt,FORBES_ACCESS_ROLE_IDS_2026.deputySeniorCapt,CONFIG.roles.seniorCapt,CONFIG.roles.deputySeniorCapt]); }
 function forbes2026Discipline(member,req){ return forbes2026Farm(member,req)||forbes2026Capt(member,req); }
 function forbes2026Complaints(member,req){ return forbes2026Full(member,req)||forbes2026HasId(member,[FORBES_ACCESS_ROLE_IDS_2026.complaintAdmin])||forbes2026HasName(member,['адміністратор скарг']); }
 
@@ -5412,8 +5421,8 @@ function chargeIsStaff(member,req){
   // Модерація звітів заряду: власник, лідер, лідер 2, зам лідера, старший каптер.
   // Звичайні учасники можуть бачити предмети й подавати звіти, але не модерувати.
   return chargeIsOwnerReq(req)||forbes2026Main(req)||
-    forbes2026HasId(member,[CONFIG.roles.leader,FORBES_ACCESS_ROLE_IDS_2026.leader2,FORBES_ACCESS_ROLE_IDS_2026.deputy,FORBES_ACCESS_ROLE_IDS_2026.seniorCapt,CONFIG.roles.seniorCapt])||
-    forbes2026HasName(member,['лідер','лідер 2','зам лідера','старший каптер']);
+    forbes2026HasId(member,[CONFIG.roles.leader,FORBES_ACCESS_ROLE_IDS_2026.leader2,FORBES_ACCESS_ROLE_IDS_2026.deputy,FORBES_ACCESS_ROLE_IDS_2026.seniorCapt,FORBES_ACCESS_ROLE_IDS_2026.deputySeniorCapt,CONFIG.roles.seniorCapt,CONFIG.roles.deputySeniorCapt])||
+    forbes2026HasName(member,['boss','лідер 2','зам лідера','head capt','dep head capt']);
 }
 function chargeIsOwnerReq(req){ return String(req.user?.id||'')===String(CONFIG.ownerId); }
 function chargeCleanItems(items){

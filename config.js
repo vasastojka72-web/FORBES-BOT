@@ -7,28 +7,44 @@ export const CONFIG = {
   // Discord role IDs from your FORBES server. Names here match your Discord roles.
   roles: {
     bot: "1504883501978095657",             // 🤖 BOT / FORBES BOT
+    boss: "1549814900963016805",            // BOSS
+    owner: "1549814900963016805",           // compatibility: найвища роль
+    leader: "1549814900963016805",          // compatibility: керівник
+    leader2: "1504871859261538425",         // Лідер 2
+    deputy: "1504871693397790871",          // Зам Лідера
+    rightHand: "1504871693397790871",       // compatibility alias для старого коду
+    complaintAdmin: "1527167132696313866",  // Адміністратор скарг
+    manager: "1511547836569751603",         // Мененжер
+    seniorModerator: "1511547550438658191", // Старший модератор
     member: process.env.MEMBER_ROLE_ID || "1553153161554952263", // Учасник
     newbie: "1504870592162168843",         // Боржник
     farmer: process.env.FARMER_ROLE_ID || "1504870952880701592", // Фармер
     farmManager: "1504871085223706664",    // Фарм менеджер
     fighter: "1504871275917738066",        // Відкуп
     capt: process.env.CAPT_ROLE_ID || "1504871411230179359",     // Каптер
-    seniorCapt: "1504871617543536782",     // Старший каптер
-    rightHand: "1504871693397790871",      // Права рука
-    deputy: "1504871859261538425"          // Зам.лідера
+    seniorCapt: "1504871617543536782",     // Head Capt
+    deputySeniorCapt: "1549097790456467660" // Dep.Head Capt
   },
 
   roleNames: {
     bot: "BOT / FORBES BOT",
+    boss: "BOSS",
+    owner: "BOSS",
+    leader: "BOSS",
+    leader2: "Лідер 2",
+    deputy: "Зам Лідера",
+    rightHand: "Зам Лідера",
+    complaintAdmin: "Адміністратор скарг",
+    manager: "Мененжер",
+    seniorModerator: "Старший модератор",
     member: "Учасник",
     newbie: "Боржник",
     farmer: "Фармер",
     farmManager: "Фарм менеджер",
     fighter: "Відкуп",
     capt: "Каптер",
-    seniorCapt: "Старший каптер",
-    rightHand: "Права рука",
-    deputy: "Зам.лідера"
+    seniorCapt: "Head Capt",
+    deputySeniorCapt: "Dep.Head Capt"
   },
 
   // Discord channel IDs you gave me earlier.
@@ -53,7 +69,7 @@ export const CONFIG = {
     captSignup: "1505002781847720047",
     captList: "1505002905135218749",
     captReminder: process.env.CAPT_REMINDER_CHANNEL_ID || "1505002988429901935",
-    captStats: "1504874503241732147",
+    captStats: "1505003070751379567",
     announcements: "1505075081926414377",
     calendar: "1505075126113275944",
     backup: "1504882852704026754",

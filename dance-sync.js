@@ -2,7 +2,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import crypto from "node:crypto";
 
 export const DANCE_ROOM = "FORBES_GLOBAL_DANCE";
-export const DANCE_EXECUTION_DELAY_MS = 1500;
+export const DANCE_EXECUTION_DELAY_MS = 3000;
 export const DANCE_COMMAND_COOLDOWN_MS = 2000;
 
 const json = (socket, value) => {
@@ -75,6 +75,12 @@ export function createDanceSyncManager({ verifyToken, logger = console } = {}) {
       return json(client, { type: "time_sync_response", sampleId: String(data.sampleId || ""), clientSend: Number(data.clientSend || 0), serverReceive, serverSend: Date.now() });
     }
     if (data.type === "heartbeat") return json(client, { type: "heartbeat_ack", clientTime: Number(data.clientTime || 0), serverTime: Date.now() });
+    if (data.type === "dance_quality") {
+      client.dancePingMs = Math.max(0, Math.min(2000, Number(data.ping || 0)));
+      client.danceJitterMs = Math.max(0, Math.min(1000, Number(data.jitter || 0)));
+      client.danceChance = Math.max(0, Math.min(100, Number(data.chance || 0)));
+      return;
+    }
     if (data.type === "dance_join") {
       const name = data.room === DANCE_ROOM ? DANCE_ROOM : DANCE_ROOM;
       leave(client);
@@ -91,12 +97,19 @@ export function createDanceSyncManager({ verifyToken, logger = console } = {}) {
     if (!rateAllowed(client.danceUser.id)) return reject(client, "rate_limited", "Забагато команд. Спробуйте трохи пізніше.");
     const createdAt = Date.now();
     if (createdAt < busyUntil) return reject(client, "busy", "Команда вже виконується.");
-    busyUntil = createdAt + DANCE_COMMAND_COOLDOWN_MS;
-    const command = { type: "dance_command", commandId: `dance_${crypto.randomUUID()}`, dance, createdAt, executeAt: createdAt + DANCE_EXECUTION_DELAY_MS, sourceDisplayName: client.danceUser.name };
+    const members=[...room(client.danceRoom)];
+    const knownQuality=members.filter(member=>Number(member.dancePingMs)>0);
+    const maxPing=knownQuality.length?Math.max(...knownQuality.map(member=>Number(member.dancePingMs)||0)):0;
+    const maxJitter=knownQuality.length?Math.max(...knownQuality.map(member=>Number(member.danceJitterMs)||0)):0;
+    const executionDelay=knownQuality.length
+      ? Math.max(DANCE_EXECUTION_DELAY_MS,Math.min(5000,2200+maxPing*2+maxJitter*4))
+      : DANCE_EXECUTION_DELAY_MS;
+    busyUntil = createdAt + executionDelay + DANCE_COMMAND_COOLDOWN_MS;
+    const command = { type: "dance_command", commandId: `dance_${crypto.randomUUID()}`, dance, createdAt, executeAt: createdAt + executionDelay, executionDelay, sourceDisplayName: client.danceUser.name };
     lastCommand = command;
     let count = 0;
-    for (const member of room(client.danceRoom)) if (json(member, command)) count++;
-    logger.info?.(`[DANCE] command accepted user=${client.danceUser.id} dance=${dance} commandId=${command.commandId} broadcast=${count}`);
+    for (const member of members) if (json(member, command)) count++;
+    logger.info?.(`[DANCE] command accepted user=${client.danceUser.id} dance=${dance} commandId=${command.commandId} delay=${executionDelay} maxPing=${maxPing} maxJitter=${maxJitter} broadcast=${count}`);
   };
   const attach = server => {
     const wss = new WebSocketServer({ noServer: true });
